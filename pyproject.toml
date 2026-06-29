@@ -1,0 +1,12 @@
+[project]
+name = "synthetic-opendental"
+version = "0.2.0"
+description = "Generate realistic synthetic data for Open Dental MySQL databases (zero real PHI)."
+readme = "README.md"
+license = { text = "MIT" }
+# The generator uses PEP 604 (X | None) type unions, which require Python 3.10+.
+requires-python = ">=3.10"
+dependencies = ["faker>=18.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/dentaljosh/synthetic-opendental"

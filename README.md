@@ -34,6 +34,8 @@ The generated database includes interconnected records across all major Open Den
 | `recall` | Hygiene recall tracking |
 | `commlog` | Communication history |
 | `procnote` | Clinical notes |
+| `perioexam` | Periodontal charting sessions |
+| `periomeasure` | Per-tooth, per-site perio measurements (probing, recession, bleeding, etc.) |
 | `definition` | Reference data for dropdowns |
 
 ### Data Characteristics
@@ -45,10 +47,13 @@ The generated database includes interconnected records across all major Open Den
 - **Realistic fee ranges** based on ADA fee surveys
 - **3 years of visit history** with seasonal patterns
 - **Family accounts** with guarantor relationships
+- **Longitudinal periodontal charting** for adults, staged/graded per the 2017 classification (see below)
 
 ## Quick Start
 
 ### Installation
+
+**Requires Python 3.10+** (the generator uses `X | None` type-union syntax).
 
 ```bash
 git clone https://github.com/dentaljosh/synthetic-opendental.git
@@ -90,6 +95,9 @@ mysql -u root -p opendental < synthetic_data.sql
 | `--state` | Random | Target state (required if --city used) |
 | `--seed` | 42 | Random seed for reproducibility |
 | `--output` | synthetic_data.sql | Output file path |
+| `--no-perio` | (off) | Skip periodontal charting and treatment generation |
+| `--stage` | (off) | **Test corner case** — force all periodontitis to one stage (`I`–`IV`); see below |
+| `--grade` | (off) | **Test corner case** — force all periodontitis to one grade (`A`–`C`); see below |
 
 ## Supported Metro Areas
 
@@ -105,17 +113,28 @@ The generator includes realistic ZIP codes for these cities:
 - San Diego, CA
 - Dallas, TX
 - Seattle, WA
+- Nashville, TN
+- Omaha, NE
+- Cleveland, OH
+- Columbus, OH
+- Cincinnati, OH
+- Boston, MA
+- Detroit, MI
+- The Woodlands, TX
+- Brentwood, TN
 
-If you specify a city/state not in this list, the generator will create plausible random ZIP codes.
+If you specify a city/state not in this list, the generator will create plausible random ZIP codes. (`--city` and `--state` must be supplied together.)
 
 ## Example Output Size
 
 | Patients | SQL File Size | Records |
 |----------|---------------|---------|
-| 100 | ~3 MB | ~25,000 |
-| 500 | ~15 MB | ~125,000 |
-| 750 | ~22 MB | ~185,000 |
-| 2,000 | ~60 MB | ~500,000 |
+| 100 | ~9 MB | ~40,000 |
+| 500 | ~43 MB | ~194,000 |
+| 750 | ~67 MB | ~300,000 |
+| 2,000 | ~174 MB | ~774,000 |
+
+> Sizes grew substantially once full periodontal charting was added (each adult accrues many `periomeasure` rows across years of exams). Use `--no-perio` for a much smaller dump if you don't need perio data.
 
 ## Use Cases
 
@@ -142,13 +161,35 @@ The generator includes 40+ real ADA D-codes covering:
 - Exams (D0120, D0140, D0150, D0180)
 - X-rays (D0210, D0274, D0330, D0367)
 - Cleanings (D1110, D1120, D1206)
-- Perio (D4341, D4342, D4910, D4355)
+- Perio (D4341, D4342, D4910, D4355, D4260, D4261, D4381)
 - Fillings (D2140, D2391-D2394, D2330-D2331)
 - Crowns (D2740, D2750, D2950)
 - Extractions (D7140, D7210, D7220-D7240)
 - Implants (D6010, D6056, D6058)
 - Endo (D3310, D3320, D3330)
 - Ortho (D8080, D8090, D8670)
+
+### Periodontal Charting & Treatment
+
+Adults (18+) receive longitudinal periodontal data modeled on the **2017 World Workshop classification** and US epidemiology:
+
+- **Staging (I–IV) and grading (A–C)** assigned with age-stratified prevalence (NHANES/Eke); smoking and diabetes shift severity and progression rate. ~30–35% of adults end up as periodontitis cases, matching typical practice hygiene benchmarks.
+- **Stage is driven by clinical attachment loss (CAL), not probing depth** — faithful to the 2017 system, where stage = interdental CAL at the worst site (I: 1–2 mm, II: 3–4 mm, III/IV: ≥5 mm) and probing depth is only a *complexity* descriptor (Tonetti, Greenwell & Kornman 2018). The model samples per-site CAL plus a gingival-margin position, and **derives probing depth** as `PD = CAL − GingMargin`. Because the margin can sit coronal to the CEJ from inflammatory swelling (a *pseudopocket*), a lower-stage patient can legitimately show **isolated deep pockets ≥6 mm** while CAL — and therefore the stage — stays in range. Deep pockets are kept localized (interproximal/molar), as in real Stage II cases.
+- **Radiographic bone loss (RBL)** is modeled as a co-determinant of stage (% of root length): I <15% and II 15–33% (coronal third), III to the middle third, IV to the apical third. **Stage III vs IV is determined by whether RBL reaches the apical third** (≥60%), consistent with tooth-loss counts — not by CAL alone. Open Dental's perio schema has no structured bone-loss field, so the value is recorded in each `perioexam`'s `Note` (e.g. *"Radiographic bone loss ~45% of root length (middle third)."*).
+- **Per-tooth, 6-site charting** in the Open Dental `perioexam` / `periomeasure` tables, using the real `PerioSequenceType` encoding: probing depth (4), gingival margin (2; coronal/negative margins are stored with Open Dental's 100+ encoding), MGJ (3), bleeding/suppuration/plaque/calculus bitmask (6), mobility (0), furcation (1). CAL itself is left for Open Dental to compute (it is never stored).
+- **Longitudinal trajectories**, not single snapshots: each later exam *evolves from the previous one*. Worsening is real attachment loss (CAL up, the irreversible progression grade governs, concentrated at already-diseased sites); scaling & root planing produces a realistic pocket reduction split between attachment gain and resolution of inflammatory swelling (Cobb 2002); maintenance holds compliant patients near-arrested while non-compliant/Grade-C patients drift downhill. Cohort-wide this reproduces the ~80% stable / ~15% slow-downhill / ~5% extreme-downhill split (Hirschfeld & Wasserman 1978, DOI 10.1902/jop.1978.49.5.225).
+- **Coherent treatment course**: comprehensive perio eval → SRP by quadrant (D4341/D4342) → re-evaluation → periodontal maintenance (D4910), with a literature-based fraction proceeding to osseous surgery (D4260/D4261) and adjunctive localized antimicrobial (D4381). Disable with `--no-perio`.
+- **Individualized maintenance recall**: the D4910 interval is *not* a fixed 3 months for everyone. It is re-decided at each visit from current risk (worst-site CAL stage, grade, smoking/diabetes, residual ≥5 mm pockets, compliance) per the Lang & Tonetti Periodontal Risk Assessment and the AAP/EFP grade mapping — roughly **6 months (low risk) → 4 (moderate) → 3 (high) → 2 (very high)**, with scheduling jitter and a ~3-month post-SRP insurance floor. It tightens when disease recurs and lengthens when stable; severe recurrence re-enters active therapy (re-SRP).
+
+> **Modeling note:** Open Dental's perio schema stores no structured radiographic-bone-loss value, so the modeled RBL percentage is surfaced in each `perioexam`'s free-text `Note` rather than a dedicated column. Stage III vs IV is driven by RBL extent (apical- vs middle-third) together with tooth loss, per the 2017 thresholds.
+
+#### Test corner-case flags: `--stage` and `--grade`
+
+By default the data reflects the **realistic distribution and progression** of disease in both stage and grade, as the literature suggests. The `--stage` and `--grade` flags are **deliberately non-realistic test corner cases** for exercising specific Open Dental functionality against a controlled cohort:
+
+- **`--stage <I|II|III|IV>`** — every periodontitis patient is fixed at that single stage, with **CAL held strictly within that stage's band for the patient's entire history** (e.g. `--stage II` keeps interdental CAL ≤4 mm and never progresses into Stage III). Probing depth is left free, so a `--stage II` cohort still shows realistic isolated deep pseudopockets (≥6 mm) — only the *stage* (CAL) is pinned. Treatment procedures (SRP, maintenance, etc.) are still recorded. Grades still vary across patients.
+- **`--grade <A|B|C>`** — every periodontitis patient is fixed at that single grade (e.g. `--grade A` keeps everyone Grade A). Stages still vary; progression follows that grade's rate.
+- The two combine (`--stage III --grade C`). Healthy patients are still generated in both modes (only diseased patients are locked). These flags only affect periodontal data and are ignored under `--no-perio`.
 
 ### Schema Compatibility
 
