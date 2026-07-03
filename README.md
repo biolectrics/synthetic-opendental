@@ -98,6 +98,8 @@ mysql -u root -p opendental < synthetic_data.sql
 | `--no-perio` | (off) | Skip periodontal charting and treatment generation |
 | `--stage` | (off) | **Test corner case** — force all periodontitis to one stage (`I`–`IV`); see below |
 | `--grade` | (off) | **Test corner case** — force all periodontitis to one grade (`A`–`C`); see below |
+| `--labels PATH` | (off) | Write the [ground-truth labels sidecar](#ground-truth-labels---labels) (JSON) alongside the SQL |
+| `--fidelity-report [PATH]` | (off) | Print a [statistical-fidelity report](#statistical-fidelity-report---fidelity-report); optionally also write it as JSON |
 
 ## Supported Metro Areas
 
@@ -127,14 +129,14 @@ If you specify a city/state not in this list, the generator will create plausibl
 
 ## Example Output Size
 
-| Patients | SQL File Size | Records |
-|----------|---------------|---------|
-| 100 | ~9 MB | ~40,000 |
-| 500 | ~43 MB | ~194,000 |
-| 750 | ~67 MB | ~300,000 |
-| 2,000 | ~174 MB | ~774,000 |
+| Patients | SQL File Size | Records | `--labels` sidecar |
+|----------|---------------|---------|--------------------|
+| 100 | ~9 MB | ~40,000 | ~0.5 MB |
+| 500 | ~43 MB | ~194,000 | ~2.6 MB |
+| 750 | ~67 MB | ~300,000 | ~3.9 MB |
+| 2,000 | ~174 MB | ~774,000 | ~10 MB |
 
-> Sizes grew substantially once full periodontal charting was added (each adult accrues many `periomeasure` rows across years of exams). Use `--no-perio` for a much smaller dump if you don't need perio data.
+> Sizes grew substantially once full periodontal charting was added (each adult accrues many `periomeasure` rows across years of exams). Use `--no-perio` for a much smaller dump if you don't need perio data. The optional `--labels` sidecar (per-site true CAL for every exam) is off by default; its size scales with the perio data (roughly 6% of the SQL).
 
 ## Use Cases
 
@@ -190,6 +192,50 @@ By default the data reflects the **realistic distribution and progression** of d
 - **`--stage <I|II|III|IV>`** — every periodontitis patient is fixed at that single stage, with **CAL held strictly within that stage's band for the patient's entire history** (e.g. `--stage II` keeps interdental CAL ≤4 mm and never progresses into Stage III). Probing depth is left free, so a `--stage II` cohort still shows realistic isolated deep pseudopockets (≥6 mm) — only the *stage* (CAL) is pinned. Treatment procedures (SRP, maintenance, etc.) are still recorded. Grades still vary across patients.
 - **`--grade <A|B|C>`** — every periodontitis patient is fixed at that single grade (e.g. `--grade A` keeps everyone Grade A). Stages still vary; progression follows that grade's rate.
 - The two combine (`--stage III --grade C`). Healthy patients are still generated in both modes (only diseased patients are locked). These flags only affect periodontal data and are ignored under `--no-perio`.
+
+### Ground-truth labels (`--labels`)
+
+The generator is, under the hood, a **generative model with fully known latent state**: for every patient it chooses a true stage/grade/bone-loss and tracks a noise-free floating-point CAL at every site, then rounds, clamps, and encodes only the *observable* records into the SQL — discarding the truth. Real clinics never have that truth, so no dataset built from real EHRs can carry it. `--labels PATH` persists it as a JSON **answer key** that joins to the SQL, turning the dump from "realistic-looking data" into a **labeled benchmark** you can train *and objectively score* models against (2017 staging classifiers, attachment-loss progression predictors, treatment-response models, and measurement-error / examiner-variability models via true CAL vs emitted probing).
+
+```bash
+python generate.py --patients 750 --seed 42 --labels labels.json --output data.sql
+```
+
+The file is a single JSON object:
+
+```jsonc
+{
+  "meta": { "schema_version": 1, "seed": 42, "generated_date": "...",
+            "flags": {...}, "citations": [...], "label_definitions": {...} },
+  "patients": [{
+    "PatNum": 10412, "age": 57, "charted": true,
+    "profile": { "true_stage": "III", "true_grade": "C", "smoker": true,
+                 "bone_loss_pct": 47, "rbl_third": "middle",
+                 "teeth_present_baseline": [...], "teeth_lost_to_perio": [...] },
+    "trajectory": { "class": "downhill", "annual_mean_cal_mm": 0.31,
+                    "treatment_response": "partial", "n_exams": 6, ... },
+    "exams": [{ "PerioExamNum": 10042, "ExamDate": "2024-03-11", "visit_type": "reeval",
+                "stage_at_visit": "III", "worst_true_cal_mm": 6.1, "risk_tier": "high",
+                "teeth": { "14": { "true_cal_mm": [5.8, 6.1, 5.9, 4.2, 4.0, 4.3],
+                                   "observed_pd_mm": [5, 6, 6, 4, 4, 4],
+                                   "recession_mm": [...], "swell": [...] } } }]
+  }]
+}
+```
+
+- **Join key:** each exam's `PerioExamNum` + tooth number map to the SQL `periomeasure` rows (`SequenceType 4` = probing). `observed_pd_mm` equals the emitted probing exactly; `true_cal_mm` is the noise-free CAL behind it (the emitted CAL = `round(true_cal)`).
+- **Derived labels** (`trajectory.class`, `annual_mean_cal_mm`, `treatment_response`) are computed from the whole-mouth mean true CAL and deep-pocket closure — the clinical longitudinal measures — not from any single noisy site.
+- Adults who are profiled but not charted (e.g. a healthy patient not selected for screening) appear with `"charted": false` and a null trajectory; minors (no perio) are omitted. Off by default; ignored under `--no-perio`.
+
+### Statistical-fidelity report (`--fidelity-report`)
+
+Proves the generated cohort actually matches the epidemiology it claims to model. `--fidelity-report` prints an observed-vs-literature table; add a path to also write it as machine-readable JSON (consumed by the CI gate in `tests/`).
+
+```bash
+python generate.py --patients 1000 --seed 42 --fidelity-report fidelity.json --output data.sql
+```
+
+Each gated metric compares the cohort against the model's literature targets with a **sampling-noise-aware tolerance** (so it is robust across seeds yet still catches real drift): stage mix vs the exact model-expected distribution; periodontitis grade mix and a monotone Grade-C-by-stage rise; smoker/diabetes/compliance prevalence; radiographic-bone-loss bands and the III/IV apical-third split; per-stage SRP utilization and "healthy get no SRP"; individualized recall cadence; the treated-cohort stable/downhill/extreme trajectory split (Hirschfeld & Wasserman reference); and the untreated **A ≤ B ≤ C** progression ordering. Low-N per-stage cells are reported as *informational*. Under `--stage`/`--grade` locks the distribution and progression metrics automatically become informational (the cohort is deliberately non-representative).
 
 ### Schema Compatibility
 

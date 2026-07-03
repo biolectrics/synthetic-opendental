@@ -18,12 +18,13 @@ Built by the team at Luna (https://yourluna.co)
 """
 
 import argparse
+import json
 import random
 import sys
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 # Must run before importing faker or defining classes that use PEP 604 (X | None)
 # type unions, both of which would otherwise fail with an obscure error on 3.9.
@@ -38,6 +39,7 @@ from faker import Faker
 
 DEFAULT_SEED = 42
 DEFAULT_PATIENT_COUNT = 750
+GENERATOR_VERSION = "0.3.0"
 
 # Age distribution percentages (based on US dental patient demographics)
 AGE_DISTRIBUTION = [
@@ -672,7 +674,8 @@ def generate_insert(table: str, columns: list[str], values: list[Any]) -> str:
 
 class SyntheticDataGenerator:
     def __init__(self, seed: int = DEFAULT_SEED, city: str = None, state: str = None, patient_count: int = DEFAULT_PATIENT_COUNT,
-                 gen_perio: bool = True, perio_stage: str = None, perio_grade: str = None):
+                 gen_perio: bool = True, perio_stage: str = None, perio_grade: str = None,
+                 gen_labels: bool = False, gen_fidelity: bool = False):
         self.seed = seed
         self.patient_count = patient_count
         self.gen_perio = gen_perio
@@ -681,6 +684,14 @@ class SyntheticDataGenerator:
         # stage's band (no progression to the next stage). See _generate_perio.
         self.perio_stage = perio_stage
         self.perio_grade = perio_grade
+        # Ground-truth capture. The generator IS a model with known latent state (true
+        # float CAL per site, true stage/grade/trajectory); normally it emits only the
+        # noisy observable EHR rows and discards the truth. When labels or the fidelity
+        # report are requested we snapshot that truth at each exam (pure observation --
+        # no RNG draws -- so the .sql output stays byte-identical either way).
+        self.gen_labels = gen_labels and gen_perio
+        self.gen_fidelity = gen_fidelity and gen_perio
+        self._perio_capture = self.gen_labels or self.gen_fidelity
         random.seed(seed)
         Faker.seed(seed)
         self.fake = Faker('en_US')
@@ -733,6 +744,10 @@ class SyntheticDataGenerator:
         self.claimprocs = []
         self.perioexams = []
         self.periomeasures = []
+        # Ground-truth capture (populated only when self._perio_capture): one snapshot
+        # dict per emitted exam; finalized into per-patient label records.
+        self.perio_snapshots = []
+        self.perio_labels = []
 
         # Use real CodeNum mapping from existing OD database
         self.code_to_codenum = REAL_CODE_TO_CODENUM.copy()
@@ -779,6 +794,8 @@ class SyntheticDataGenerator:
         self._generate_appointments_and_procedures()
         if self.gen_perio:
             self._generate_perio()
+            if self._perio_capture:
+                self._finalize_perio_labels()   # trajectory/response labels; used by both flags
         self._generate_recalls()
         self._generate_commlogs()
         self._generate_payments()
@@ -1656,7 +1673,10 @@ class SyntheticDataGenerator:
         if total:
             print(f"    Periodontitis (any stage): {perio_ct} ({100*perio_ct/total:.1f}%)")
 
-    def _perio_sample_stage(self, patient: dict, smoker: bool, diabetic: bool) -> str:
+    def _perio_stage_weights(self, patient: dict, smoker: bool, diabetic: bool) -> list:
+        """Age/sex/smoker/diabetic-adjusted stage-prevalence weights (order = PERIO_STAGES),
+        unnormalized. Pure -- draws no RNG -- so the fidelity report can average these across
+        the cohort to derive the exact model-expected stage mix (catches sampler bias)."""
         age = patient["Age"]
         weights = None
         for max_age, w in AGE_STAGE_DISTRIBUTION:
@@ -1671,6 +1691,10 @@ class SyntheticDataGenerator:
             weights = [weights[0]*0.6, weights[1]*0.9, weights[2]*1.1, weights[3]*2.0, weights[4]*2.0]
         if diabetic:
             weights = [weights[0]*0.8, weights[1]*0.95, weights[2]*1.15, weights[3]*1.6, weights[4]*1.6]
+        return weights
+
+    def _perio_sample_stage(self, patient: dict, smoker: bool, diabetic: bool) -> str:
+        weights = self._perio_stage_weights(patient, smoker, diabetic)
         return random.choices(PERIO_STAGES, weights=weights)[0]
 
     def _perio_sample_grade(self, stage: str, smoker: bool, diabetic: bool) -> str:
@@ -1727,13 +1751,10 @@ class SyntheticDataGenerator:
         third = "coronal third" if pct < 33 else "middle third" if pct < RBL_APICAL_THRESHOLD else "apical third"
         return f"~{pct}% of root length ({third})"
 
-    def _perio_recall_days(self, chart: dict, profile: dict) -> int:
-        """Individualized D4910 recall interval (days), re-decided from the patient's
-        CURRENT status. The RECOMMENDED interval is risk-based (worst-site CAL stage,
-        grade, smoking, residual >=6mm pockets, diabetes). The REALIZED interval then
-        stretches for non-compliant patients, who skip/delay visits -- the literature
-        shows regular compliers cluster at ~3-4 months while non-compliers average
-        ~6.3 months. Returns the realized interval with scheduling jitter."""
+    def _perio_risk_tier(self, chart: dict, profile: dict) -> tuple:
+        """Risk tier + RECOMMENDED recall (months) from the patient's CURRENT chart and
+        profile: worst-site CAL stage, grade, smoking, residual >=6mm pockets, diabetes.
+        Pure (no RNG) so the labels capture can record the tier at each visit."""
         cur_stage = self._stage_from_cal(self._chart_worst_cal(chart))
         residual_deep = sum(1 for t in chart.values() for i in range(6) if self._site_pd(t, i) >= 6)
         high = 0
@@ -1753,7 +1774,15 @@ class SyntheticDataGenerator:
             tier = "moderate"           # Grade B / diabetic -> ~4 months
         else:
             tier = "low"                # Grade A, Stage I/II, compliant, no risk -> ~6 months
-        months = PERIO_RECALL_MONTHS[tier]
+        return tier, PERIO_RECALL_MONTHS[tier]
+
+    def _perio_recall_days(self, chart: dict, profile: dict) -> int:
+        """Individualized D4910 recall interval (days), re-decided from the patient's
+        CURRENT status. The RECOMMENDED interval is risk-based (via _perio_risk_tier). The
+        REALIZED interval then stretches for non-compliant patients, who skip/delay visits
+        -- the literature shows regular compliers cluster at ~3-4 months while non-compliers
+        average ~6.3 months. Returns the realized interval with scheduling jitter."""
+        _tier, months = self._perio_risk_tier(chart, profile)
         if not profile["compliant"]:
             months *= random.uniform(1.5, 2.2)   # irregular compliers stretch/skip recall
         # +/-10-20% scheduling jitter; clamp to plausible booking bounds (up to ~18 mo).
@@ -1958,10 +1987,14 @@ class SyntheticDataGenerator:
         ))
 
     def _emit_perio_exam(self, patient: dict, exam_date: date, chart: dict, prov_num: int,
-                         full: bool, inflammation: float):
-        """Emit one perioexam plus its data-bearing periomeasure rows."""
+                         full: bool, inflammation: float, visit_type: str = "maintenance",
+                         gap_days: int = None, srp_done: bool = False, surgery_done: bool = False):
+        """Emit one perioexam plus its data-bearing periomeasure rows. Returns the new
+        PerioExamNum (None if the chart is empty). When ground-truth capture is enabled,
+        also records a noise-free per-site snapshot of this exam -- pure observation, no
+        RNG, so the emitted SQL is unaffected."""
         if not chart:
-            return
+            return None
         exam_num = self.next_perioexam_num
         self.next_perioexam_num += 1
         exam_dt = datetime.combine(
@@ -1984,6 +2017,7 @@ class SyntheticDataGenerator:
 
         # Baseline bleeding burden tracks the CURRENT severity (worst-site CAL) of this exam.
         bop = STAGE_CAL_RANGES[self._stage_from_cal(self._chart_worst_cal(chart))]["bop"]
+        teeth_snap = {} if self._perio_capture else None
 
         for tooth in sorted(chart.keys()):
             t = chart[tooth]
@@ -1992,6 +2026,14 @@ class SyntheticDataGenerator:
             # regardless of the 1..12 probing clamp. margin = round(CAL) - PD.
             pd = [self._site_pd(t, i) for i in range(6)]
             margin = [int(round(t["cal"][i])) - pd[i] for i in range(6)]
+            if teeth_snap is not None:
+                # Noise-free truth vs the emitted (rounded/clamped) probing, per site.
+                teeth_snap[tooth] = {
+                    "true_cal_mm": [round(t["cal"][i], 3) for i in range(6)],
+                    "observed_pd_mm": list(pd),
+                    "recession_mm": list(t["rec"]),
+                    "swell": list(t["swell"]),
+                }
             # Probing depth (always)
             self._create_periomeasure(exam_num, exam_dt, PERIO_SEQ_PROBING, tooth, PERIO_NO_MEASURE, pd)
             # Gingival margin (always); coronal/negative (pseudopocket) encodes as 100+|v|
@@ -2017,6 +2059,31 @@ class SyntheticDataGenerator:
             if t["mob"] > 0:
                 self._create_periomeasure(exam_num, exam_dt, PERIO_SEQ_MOBILITY, tooth, t["mob"],
                                           [PERIO_NO_MEASURE] * 6)
+
+        if self._perio_capture:
+            # Float worst interdental CAL (sub-mm) for precise trajectory rates.
+            worst_true = 0.0
+            for tt in chart.values():
+                for i in PERIO_INTERPROX_IDX:
+                    if tt["cal"][i] > worst_true:
+                        worst_true = tt["cal"][i]
+            profile = patient.get("perio") or {}
+            tier = self._perio_risk_tier(chart, profile)[0] if profile else None
+            self.perio_snapshots.append({
+                "PatNum": patient["PatNum"],
+                "PerioExamNum": exam_num,
+                "ExamDate": exam_date.isoformat(),
+                "visit_type": visit_type,
+                "srp_done": srp_done,
+                "surgery_done": surgery_done,
+                "inflammation": round(inflammation, 3),
+                "gap_days": gap_days,
+                "risk_tier": tier,
+                "stage_at_visit": self._stage_from_cal(self._chart_worst_cal(chart)),
+                "worst_true_cal_mm": round(worst_true, 3),
+                "teeth": teeth_snap,
+            })
+        return exam_num
 
     def _create_perio_appointment(self, patient: dict, apt_date: date, proc_specs: list,
                                   is_hygiene: bool, prov_num: int):
@@ -2105,7 +2172,8 @@ class SyntheticDataGenerator:
                 first_exam = True
                 while d <= self.today:
                     self._perio_jitter_healthy(chart)
-                    self._emit_perio_exam(patient, d, chart, hygienist, full=first_exam, inflammation=1.0)
+                    self._emit_perio_exam(patient, d, chart, hygienist, full=first_exam, inflammation=1.0,
+                                          visit_type="screening")
                     first_exam = False
                     d = d + timedelta(days=random.randint(330, 420))
                 continue
@@ -2118,7 +2186,8 @@ class SyntheticDataGenerator:
             if random.random() < tx["fmd"]:
                 eval_specs.append(("D4355", None, None))
             self._create_perio_appointment(patient, eval_date, eval_specs, is_hygiene=False, prov_num=dentist)
-            self._emit_perio_exam(patient, eval_date, chart, dentist, full=True, inflammation=inflammation)
+            self._emit_perio_exam(patient, eval_date, chart, dentist, full=True, inflammation=inflammation,
+                                  visit_type="baseline")
             last_date = eval_date
 
             if not profile["treated"]:
@@ -2126,7 +2195,8 @@ class SyntheticDataGenerator:
                 d = eval_date + timedelta(days=random.randint(150, 210))
                 while d <= self.today:
                     self._perio_evolve(chart, grade, 1.0, stage)
-                    self._emit_perio_exam(patient, d, chart, hygienist, full=False, inflammation=inflammation)
+                    self._emit_perio_exam(patient, d, chart, hygienist, full=False, inflammation=inflammation,
+                                          visit_type="progression")
                     d = d + timedelta(days=random.randint(170, 210))
                 continue
 
@@ -2152,6 +2222,7 @@ class SyntheticDataGenerator:
             # 3) Re-evaluation ~6 weeks after SRP applies the one-time improvement.
             # (In --stage test mode the chart is held in-band, so the SRP drop is
             # suppressed -- the treatment procedures are still recorded.)
+            srp_done, surgery_done = True, False
             reeval_date = last_date + timedelta(days=random.randint(35, 49))
             if not self.perio_stage:
                 self._perio_apply_srp(chart)
@@ -2159,7 +2230,8 @@ class SyntheticDataGenerator:
                 self._create_perio_appointment(patient, reeval_date, [("D0120", None, None)],
                                                is_hygiene=False, prov_num=dentist)
                 self._emit_perio_exam(patient, reeval_date, chart, dentist, full=True,
-                                      inflammation=inflammation * 0.7)
+                                      inflammation=inflammation * 0.7, visit_type="reeval",
+                                      srp_done=True)
                 last_date = reeval_date
 
             # 4) A fraction proceed to osseous surgery for residual deep pockets.
@@ -2173,8 +2245,10 @@ class SyntheticDataGenerator:
                     specs = [(surg_code, q, None) for q in deep_quads]
                     self._create_perio_appointment(patient, surg_date, specs, is_hygiene=False, prov_num=dentist)
                     self._emit_perio_exam(patient, surg_date, chart, dentist, full=True,
-                                          inflammation=inflammation * 0.6)
+                                          inflammation=inflammation * 0.6, visit_type="post_surgery",
+                                          srp_done=True, surgery_done=True)
                     last_date = surg_date
+                    surgery_done = True
 
             # 5) Periodontal maintenance (D4910). The perio module owns these visits (the
             # generic recall stream skips routine prophy for maintenance patients). The
@@ -2210,18 +2284,451 @@ class SyntheticDataGenerator:
                     specs = [("D0180", None, None)] + [("D4341", q, None) for q in aff_quads]
                     self._create_perio_appointment(patient, step, specs, is_hygiene=False, prov_num=dentist)
                     self._perio_apply_srp(chart)
-                    self._emit_perio_exam(patient, step, chart, dentist, full=True, inflammation=inflammation)
+                    self._emit_perio_exam(patient, step, chart, dentist, full=True, inflammation=inflammation,
+                                          visit_type="recurrence", gap_days=gap,
+                                          srp_done=True, surgery_done=surgery_done)
                 else:
                     self._create_perio_appointment(
                         patient, step, [("D0120", None, None), ("D4910", None, None)],
                         is_hygiene=True, prov_num=hygienist)
                     if i % 2 == 0:
-                        self._emit_perio_exam(patient, step, chart, hygienist, full=False, inflammation=inflammation)
+                        self._emit_perio_exam(patient, step, chart, hygienist, full=False,
+                                              inflammation=inflammation, visit_type="maintenance",
+                                              gap_days=gap, srp_done=True, surgery_done=surgery_done)
                 gap = self._perio_recall_days(chart, profile)
                 step = step + timedelta(days=gap)
                 i += 1
 
         print(f"    Created {len(self.perioexams)} perio exams, {len(self.periomeasures)} measurements")
+
+    @staticmethod
+    def _rbl_third(pct: int) -> str:
+        """Radiographic-bone-loss third (structured label). Uses the 2017 staging bands:
+        <15% none/Stage-I, 15-33% coronal third, 33-60% middle third, >=60% apical third."""
+        if pct < 15:
+            return "none"
+        if pct < 33:
+            return "coronal"
+        if pct < RBL_APICAL_THRESHOLD:
+            return "middle"
+        return "apical"
+
+    @staticmethod
+    def _exam_mean_cal(exam: dict) -> float:
+        """Whole-mouth mean true CAL for an exam (all sites, all present teeth). The robust
+        longitudinal outcome measure -- far less noisy than the worst single site."""
+        vals = [c for t in exam["teeth"].values() for c in t["true_cal_mm"]]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    @staticmethod
+    def _exam_deep_sites(exam: dict, thr: float = 5.0) -> int:
+        """Count of sites at or beyond a deep-pocket CAL threshold -- the clinical
+        pocket-closure metric used to grade treatment response."""
+        return sum(1 for t in exam["teeth"].values() for c in t["true_cal_mm"] if c >= thr)
+
+    def _derive_trajectory(self, profile: dict, exams: list) -> dict:
+        """Derive the emergent per-patient labels the model never stores: the longitudinal
+        trajectory class, annual attachment-loss rate, and treatment response. Pure -- reads
+        only the captured exam snapshots. Class is judged on WHOLE-MOUTH MEAN true CAL change
+        (the clinical standard; worst-site max is too noisy) plus tooth loss; thresholds are
+        calibrated so the treated cohort lands near the Hirschfeld & Wasserman 83/13/4
+        stable/downhill/extreme split."""
+        if not exams:
+            return None
+        first, last = exams[0], exams[-1]
+        span_years = max((date.fromisoformat(last["ExamDate"])
+                          - date.fromisoformat(first["ExamDate"])).days / 365.25, 0.5)
+        mean0, mean1 = self._exam_mean_cal(first), self._exam_mean_cal(last)
+        annual_mean = (mean1 - mean0) / span_years
+        annual_worst = (last["worst_true_cal_mm"] - first["worst_true_cal_mm"]) / span_years
+        teeth_lost = len(set(first["teeth"].keys()) - set(last["teeth"].keys()))
+        if teeth_lost >= 2 or annual_mean >= 0.5:
+            cls = "extreme"
+        elif teeth_lost >= 1 or annual_mean >= 0.2:
+            cls = "downhill"
+        else:
+            cls = "stable"
+        # Treatment response = pocket closure at re-evaluation: the reduction in the number of
+        # deep (CAL>=5mm) sites after SRP (the clinical "did therapy work" measure). Falls back
+        # to whole-mouth mean-CAL improvement for patients with no deep sites at baseline.
+        response, deep0, deep1 = "untreated", None, None
+        if profile["treated"]:
+            post = next((e for e in exams if e["visit_type"] in ("reeval", "post_surgery")), None)
+            if post is None:
+                response = "unknown"
+            else:
+                deep0, deep1 = self._exam_deep_sites(first), self._exam_deep_sites(post)
+                if deep0 > 0:
+                    red = (deep0 - deep1) / deep0
+                else:
+                    drop = self._exam_mean_cal(first) - self._exam_mean_cal(post)
+                    red = drop / 0.8            # scale a mean-CAL drop onto the same bands
+                response = "responder" if red >= 0.5 else "partial" if red >= 0.2 else "refractory"
+        return {
+            "class": cls,
+            "annual_mean_cal_mm": round(annual_mean, 3),
+            "annual_worst_cal_mm": round(annual_worst, 3),
+            "mean_cal_baseline_mm": round(mean0, 3),
+            "mean_cal_final_mm": round(mean1, 3),
+            "worst_cal_baseline_mm": first["worst_true_cal_mm"],
+            "worst_cal_final_mm": last["worst_true_cal_mm"],
+            "deep_sites_baseline": deep0,
+            "deep_sites_post_srp": deep1,
+            "teeth_lost": teeth_lost,
+            "treatment_response": response,
+            "n_exams": len(exams),
+            "span_years": round(span_years, 2),
+        }
+
+    def _finalize_perio_labels(self):
+        """Assemble per-patient ground-truth label records from the exam snapshots captured
+        during _generate_perio. Pure post-processing (no RNG): group by patient, attach the
+        latent profile, and derive the emergent trajectory / treatment-response labels."""
+        by_pat = defaultdict(list)
+        for s in self.perio_snapshots:
+            by_pat[s["PatNum"]].append(s)
+
+        self.perio_labels = []
+        for patient in self.patients:                     # deterministic order; minors skipped
+            profile = patient.get("perio")
+            if not profile:
+                continue
+            exams = sorted(by_pat.get(patient["PatNum"], []),
+                           key=lambda e: (e["ExamDate"], e["PerioExamNum"]))
+            if exams:
+                baseline_teeth = set(exams[0]["teeth"].keys())
+                lost = sorted(baseline_teeth - set(exams[-1]["teeth"].keys()))
+                present = sorted(baseline_teeth)
+            else:                                          # profiled but never charted
+                present, lost = sorted(profile["teeth"]), []
+            self.perio_labels.append({
+                "PatNum": patient["PatNum"],
+                "age": patient["Age"],
+                "gender": patient["Gender"],
+                "charted": bool(exams),
+                "profile": {
+                    "true_stage": profile["stage"],
+                    "true_grade": profile["grade"],
+                    "smoker": profile["smoker"],
+                    "diabetic": profile["diabetic"],
+                    "treated": profile["treated"],
+                    "compliant": profile["compliant"],
+                    "bone_loss_pct": profile["bone_loss"],
+                    "rbl_third": self._rbl_third(profile["bone_loss"]),
+                    "teeth_present_baseline": present,
+                    "teeth_lost_to_perio": lost,
+                },
+                "trajectory": self._derive_trajectory(profile, exams),
+                "exams": exams,
+            })
+
+    # Ground-truth field documentation embedded in the labels file's meta block.
+    _LABEL_CITATIONS = [
+        "2017 World Workshop staging/grading (Tonetti, Greenwell, Kornman; Papapanou et al. 2018)",
+        "NHANES / Eke et al. periodontitis prevalence",
+        "Cobb 2002; Hung & Douglass 2002 (SRP attachment response)",
+        "Loe et al. 1986 (natural history of periodontitis)",
+        "Hirschfeld & Wasserman 1978, J Periodontol 49(5):225 (long-term maintenance outcomes)",
+        "Lang & Tonetti Periodontal Risk Assessment; AAP/EFP grade-to-recall mapping",
+    ]
+    _LABEL_DEFINITIONS = {
+        "profile.true_stage": "2017 stage the patient was generated as (healthy, I-IV); ground truth, NOT inferred from measurements.",
+        "profile.true_grade": "2017 grade A/B/C governing progression speed.",
+        "profile.bone_loss_pct": "True radiographic bone loss (% of root length); III vs IV split at the apical-third threshold (>=60%).",
+        "profile.rbl_third": "Bone-loss third: none (<15%) / coronal / middle / apical.",
+        "trajectory.class": "stable | downhill | extreme, from first-vs-last worst-site TRUE CAL and tooth loss (calibrated to Hirschfeld & Wasserman 83/13/4).",
+        "trajectory.annual_cal_mm": "Mean annual change in worst-site true CAL (mm/yr); negative = net improvement after therapy.",
+        "trajectory.treatment_response": "responder (>=1.5mm CAL gain at re-eval) | partial (>=0.5) | refractory (<0.5) | untreated.",
+        "exams[].worst_true_cal_mm": "Noise-free worst interdental CAL at that visit (float mm).",
+        "exams[].stage_at_visit": "Stage implied by worst true CAL at that visit (III vs IV not separable by CAL alone).",
+        "exams[].risk_tier": "Recommended-recall risk tier at that visit (very_high/high/moderate/low).",
+        "exams[].teeth[tooth].true_cal_mm": "Per-site noise-free CAL, 6 sites in order MB,B,DB,ML,L,DL.",
+        "exams[].teeth[tooth].observed_pd_mm": "Emitted probing depth in the SQL for the same site; observed = round(true_cal) - recession + swell, clamped 1..12.",
+        "_join": "exams[].PerioExamNum + tooth number -> SQL periomeasure rows (SequenceType 4 = probing, 2 = gingival margin).",
+    }
+
+    def write_perio_labels(self, path: str):
+        """Serialize the ground-truth labels to a single JSON object (the SQL's answer key)."""
+        doc = {
+            "meta": {
+                "schema_version": 1,
+                "generator_version": GENERATOR_VERSION,
+                "seed": self.seed,
+                "patient_count": self.patient_count,
+                "generated_date": self.today.isoformat(),
+                "metro": f"{self.metro['city']}, {self.metro['state']}",
+                "flags": {
+                    "stage_lock": self.perio_stage,
+                    "grade_lock": self.perio_grade,
+                    "no_perio": not self.gen_perio,
+                },
+                "citations": self._LABEL_CITATIONS,
+                "label_definitions": self._LABEL_DEFINITIONS,
+            },
+            "patients": self.perio_labels,
+        }
+        with open(path, "w") as f:
+            json.dump(doc, f, separators=(",", ":"), default=str)
+        print(f"  Ground-truth labels written to {path} "
+              f"({len(self.perio_labels)} patients, {len(self.perio_snapshots)} exam snapshots)")
+
+    # ---- Statistical-fidelity report -------------------------------------------------
+    @staticmethod
+    def _grade_bump_prob(smoker: bool, diabetic: bool) -> float:
+        """P(grade bumped up one tier) implied by the smoker/diabetic modifier in
+        _perio_sample_grade -- lets the report compute the exact model-expected grade mix."""
+        if smoker and diabetic:
+            return 0.8            # 1 - (1-0.6)*(1-0.5)
+        if smoker:
+            return 0.6
+        if diabetic:
+            return 0.5
+        return 0.0
+
+    def _perio_fidelity_report(self) -> dict:
+        """Compare the generated cohort against the epidemiological/clinical literature the
+        model targets. Pure: reads profiles, the finalized labels, and emitted procedures --
+        no RNG. Each metric carries observed/expected/deviation and a pass flag; low-N or
+        lock-invalidated metrics are reported but not gated. all_pass = every gated metric
+        within tolerance."""
+        STAGES = PERIO_STAGES
+        adults = [p for p in self.patients if p.get("perio")]
+        n = len(adults)
+        metrics = []
+
+        def add(name, detail, observed, expected, tol, gated=True, kind="scalar", note=""):
+            if kind == "vector":
+                dev = max(abs(o - e) for o, e in zip(observed, expected)) if observed else 0.0
+            else:
+                dev = abs(observed - expected)
+            metrics.append({
+                "name": name, "detail": detail, "kind": kind,
+                "observed": observed, "expected": expected,
+                "deviation": round(dev, 4), "tolerance": round(tol, 4),
+                "gated": gated, "pass": (dev <= tol) if gated else None, "note": note,
+            })
+
+        def stol(p, nn, z=4.0, floor=0.03):
+            """Sampling-aware tolerance: z standard errors of a proportion p at sample size
+            nn (z=4 => a spurious CI failure well under 0.01%). Keeps gates robust to Monte-
+            Carlo noise across seeds while still catching real distributional drift."""
+            return max(floor, z * ((p * (1 - p) / max(nn, 1)) ** 0.5))
+
+        stage_ok = not self.perio_stage          # stage-distribution metrics valid only unlocked
+        grade_ok = not self.perio_grade
+        default_mode = stage_ok and grade_ok     # progression/trajectory need the unlocked model
+
+        # 1) Stage mix vs the EXACT model-expected mix (mean of the per-patient stage-weight
+        #    vectors). RBL reshuffles III<->IV without changing the III+IV total, so gate on
+        #    [healthy, I, II, III+IV]; the raw 5-vector is reported for context.
+        stage_counts = Counter(p["perio"]["stage"] for p in adults)
+        obs5 = [round(stage_counts[s] / n, 4) for s in STAGES]
+        exp_acc = [0.0] * 5
+        for p in adults:
+            pr = p["perio"]
+            w = self._perio_stage_weights(p, pr["smoker"], pr["diabetic"])
+            tot = sum(w)
+            for k in range(5):
+                exp_acc[k] += w[k] / tot
+        exp5 = [round(x / n, 4) for x in exp_acc]
+        collapse = lambda v: [v[0], v[1], v[2], round(v[3] + v[4], 4)]
+        obs4, exp4 = collapse(obs5), collapse(exp5)
+        add("stage_mix", "cohort stage prevalence [healthy, I, II, III+IV] vs model-expected",
+            obs4, exp4, stol(max(exp4), n), gated=stage_ok, kind="vector",
+            note=f"raw obs {obs5} vs exp {exp5}")
+
+        # 2) Grade mix. Per-stage cells are noisy (low N) so they are reported as INFORMATION;
+        #    gating is on the pooled periodontitis grade mix (good N) and the monotone rise of
+        #    the Grade-C share with stage. Expected = EXACT model prior + smoker/diabetic bump.
+        def grade_expected(group):
+            eA = eB = eC = 0.0
+            for p in group:
+                prior = dict(STAGE_GRADE_DISTRIBUTION[p["perio"]["stage"]])
+                pA, pB, pC = prior.get("A", 0), prior.get("B", 0), prior.get("C", 0)
+                q = self._grade_bump_prob(p["perio"]["smoker"], p["perio"]["diabetic"])
+                eA += pA * (1 - q)
+                eB += pA * q + pB * (1 - q)
+                eC += pB * q + pC
+            m = max(len(group), 1)
+            return [round(eA / m, 4), round(eB / m, 4), round(eC / m, 4)]
+
+        for stage in ("I", "II", "III", "IV"):
+            grp = [p for p in adults if p["perio"]["stage"] == stage]
+            if not grp:
+                continue
+            gc = Counter(p["perio"]["grade"] for p in grp)
+            obs = [round(gc[g] / len(grp), 4) for g in ("A", "B", "C")]
+            add(f"grade_mix_{stage}", f"Stage {stage} grade [A,B,C] vs model-expected (n={len(grp)})",
+                obs, grade_expected(grp), 0.0, gated=False, kind="vector")
+        perio = [p for p in adults if p["perio"]["stage"] != "healthy"]
+        if perio:
+            gc = Counter(p["perio"]["grade"] for p in perio)
+            obs = [round(gc[g] / len(perio), 4) for g in ("A", "B", "C")]
+            exp = grade_expected(perio)
+            add("grade_mix_overall", f"periodontitis grade [A,B,C] vs model-expected (n={len(perio)})",
+                obs, exp, stol(max(exp), len(perio)), gated=grade_ok, kind="vector")
+        cfrac = {}
+        for stage in ("I", "II", "III", "IV"):
+            grp = [p for p in adults if p["perio"]["stage"] == stage]
+            if len(grp) >= 20:                       # only compare adequately-populated stages
+                cfrac[stage] = round(sum(1 for p in grp if p["perio"]["grade"] == "C") / len(grp), 3)
+        present = [s for s in ("I", "II", "III", "IV") if s in cfrac]
+        mono = all(cfrac[present[i]] <= cfrac[present[i + 1]] + 0.06 for i in range(len(present) - 1))
+        add("grade_c_monotonic", f"Grade-C share rises with stage (n>=20) {cfrac}",
+            0 if mono else 1, 0, 0, gated=grade_ok and len(present) >= 2)
+
+        # 3) Risk-factor prevalence vs the sampling constants (sampling-aware tolerance).
+        add("smoker_prevalence", "current smokers",
+            round(sum(p["perio"]["smoker"] for p in adults) / n, 4), 0.17, stol(0.17, n))
+        add("diabetic_prevalence", "diabetics",
+            round(sum(p["perio"]["diabetic"] for p in adults) / n, 4), 0.10, stol(0.10, n))
+        add("compliant_prevalence", "regular compliers",
+            round(sum(p["perio"]["compliant"] for p in adults) / n, 4), 0.70, stol(0.70, n))
+
+        # 4) Radiographic bone loss: every stage's RBL must sit inside its 2017 band, and the
+        #    III-vs-IV split must be decided by the apical-third threshold.
+        band_violations = 0
+        rbl_means = {}
+        for stage in STAGES:
+            grp = [p["perio"]["bone_loss"] for p in adults if p["perio"]["stage"] == stage]
+            if not grp:
+                continue
+            lo, hi = STAGE_BONE_LOSS[stage]
+            band_violations += sum(1 for v in grp if not (lo <= v <= hi))
+            rbl_means[stage] = round(sum(grp) / len(grp), 1)
+        add("rbl_bands", f"RBL within each stage's 2017 band (means {rbl_means})",
+            band_violations, 0, 0)
+        iv = [p for p in adults if p["perio"]["stage"] == "IV"]
+        iii = [p for p in adults if p["perio"]["stage"] == "III"]
+        split_bad = sum(1 for p in iv if p["perio"]["bone_loss"] < RBL_APICAL_THRESHOLD) \
+            + sum(1 for p in iii if p["perio"]["bone_loss"] >= RBL_APICAL_THRESHOLD)
+        add("rbl_iii_iv_split", "Stage IV RBL>=apical third & III below it",
+            split_bad, 0, 0, gated=stage_ok)
+
+        # 5) Treatment utilization: healthy get no SRP; per-stage SRP rate tracks srp_prob.
+        srp_codes, surg_codes = {"D4341", "D4342"}, {"D4260", "D4261"}
+        srp_pats = {pr["PatNum"] for pr in self.procedures if pr["ProcCode"] in srp_codes}
+        surg_pats = {pr["PatNum"] for pr in self.procedures if pr["ProcCode"] in surg_codes}
+        healthy_srp = sum(1 for p in adults if p["perio"]["stage"] == "healthy" and p["PatNum"] in srp_pats)
+        add("healthy_no_srp", "healthy patients receive no SRP", healthy_srp, 0, 0)
+        for stage in ("II", "III", "IV"):
+            grp = [p for p in adults if p["perio"]["stage"] == stage]
+            if len(grp) < 25:
+                continue
+            obs_srp = round(sum(1 for p in grp if p["PatNum"] in srp_pats) / len(grp), 4)
+            exp_srp = STAGE_TREATMENT[stage]["srp_prob"]
+            # +0.06 one-sided allowance: emitted SRP trails srp_prob when a patient's re-eval
+            # falls after today, so observed is biased slightly low.
+            add(f"srp_rate_{stage}", f"Stage {stage} SRP utilization (n={len(grp)})",
+                obs_srp, exp_srp, stol(exp_srp, len(grp)) + 0.06, gated=stage_ok,
+                note="emitted may trail srp_prob when re-eval dates are still in the future")
+
+        # 6) Maintenance recall cadence: individualized, spanning multiple tiers.
+        d4910 = defaultdict(list)
+        for pr in self.procedures:
+            if pr["ProcCode"] == "D4910":
+                d4910[pr["PatNum"]].append(pr["ProcDate"])
+        intervals = []
+        for dates in d4910.values():
+            ds = sorted(dates)
+            intervals += [(ds[i] - ds[i - 1]).days for i in range(1, len(ds))]
+        if intervals:
+            mean_mo = sum(intervals) / len(intervals) / 30.4
+            tiers = len({round(x / 30.4) for x in intervals})
+        else:
+            mean_mo, tiers = 0, 0
+        add("recall_mean_months", f"mean D4910 interval ({len(intervals)} gaps)",
+            round(mean_mo, 2), 3.7, 1.5, note="risk-based band ~2-6mo")
+        add("recall_tiers", "distinct monthly cadence tiers present", tiers, 3, 0,
+            gated=True, note="pass = observed >= 3")
+        # recall_tiers is a >= check, not within-tolerance:
+        metrics[-1]["pass"] = tiers >= 3
+        metrics[-1]["deviation"] = max(0, 3 - tiers)
+
+        # 7) Longitudinal trajectory of TREATED periodontitis patients vs Hirschfeld &
+        #    Wasserman ~83/13/4 (well-maintained / downhill / extreme).
+        treated = [r for r in self.perio_labels
+                   if r["charted"] and r["profile"]["treated"] and r["trajectory"]
+                   and r["trajectory"]["n_exams"] >= 2]
+        if treated:
+            tc = Counter(r["trajectory"]["class"] for r in treated)
+            k = len(treated)
+            obs_tr = [round(tc["stable"] / k, 4), round(tc["downhill"] / k, 4), round(tc["extreme"] / k, 4)]
+        else:
+            obs_tr = [0, 0, 0]
+        add("trajectory_split", f"treated [stable, downhill, extreme] vs 83/13/4 ref (n={len(treated)})",
+            obs_tr, [0.83, 0.13, 0.04], 0.0, gated=default_mode, kind="vector",
+            note="Hirschfeld & Wasserman is a ~22yr reference; over a <=3yr window the gate is: "
+                 "majority stable, a real downhill/extreme tail, extreme rarer than downhill")
+        stable_f, down_f, ext_f = obs_tr
+        traj_ok = (0.75 <= stable_f <= 0.98) and (ext_f <= down_f + 0.03) and (down_f + ext_f >= 0.02)
+        metrics[-1]["deviation"] = 0 if traj_ok else 1
+        if default_mode:
+            metrics[-1]["pass"] = traj_ok
+
+        # 8) Progression ordering by grade among UNTREATED (prophy-only) periodontitis
+        #    patients -- the unconfounded natural-history cohort, evolving at the full grade
+        #    rate. Mean annual whole-mouth CAL change must rise A <= B <= C. (Treated patients
+        #    are excluded: aggressive SRP on grade C inverts the realized ordering.) Natural
+        #    -history reference: 0.08/0.24/0.80 mm/yr.
+        by_grade = defaultdict(list)
+        for r in self.perio_labels:
+            if (r["charted"] and r["profile"]["true_stage"] != "healthy"
+                    and not r["profile"]["treated"]
+                    and r["trajectory"] and r["trajectory"]["n_exams"] >= 2):
+                by_grade[r["profile"]["true_grade"]].append(r["trajectory"]["annual_mean_cal_mm"])
+        gmeans = {g: round(sum(v) / len(v), 3) for g, v in by_grade.items() if v}
+        ordered = all(
+            gmeans.get(a, -9) <= gmeans.get(b, 9)
+            for a, b in (("A", "B"), ("B", "C")) if a in gmeans and b in gmeans)
+        enough = sum(len(v) for v in by_grade.values()) >= 30 and len(gmeans) >= 2
+        add("progression_ordering", f"untreated mean annual CAL change rises A<=B<=C {gmeans}",
+            0 if ordered else 1, 0, 0, gated=default_mode and enough,
+            note="natural-history reference 0.08/0.24/0.80 mm/yr; realized rates lower over a <=3yr window")
+
+        gated = [m for m in metrics if m["gated"]]
+        all_pass = all(m["pass"] for m in gated)
+        return {
+            "meta": {
+                "generator_version": GENERATOR_VERSION, "seed": self.seed,
+                "patient_count": self.patient_count, "adults_profiled": n,
+                "metro": f"{self.metro['city']}, {self.metro['state']}",
+                "flags": {"stage_lock": self.perio_stage, "grade_lock": self.perio_grade},
+            },
+            "metrics": metrics,
+            "gated_count": len(gated),
+            "gated_passed": sum(1 for m in gated if m["pass"]),
+            "all_pass": all_pass,
+        }
+
+    def _print_fidelity_report(self, report: dict):
+        """Render the fidelity report as an aligned observed-vs-expected/PASS table."""
+        m = report["meta"]
+        print("\n" + "=" * 64)
+        print(f"PERIO STATISTICAL-FIDELITY REPORT (n={m['adults_profiled']} adults, seed={m['seed']})")
+        if m["flags"]["stage_lock"] or m["flags"]["grade_lock"]:
+            print(f"  locks: stage={m['flags']['stage_lock']} grade={m['flags']['grade_lock']} "
+                  f"(distribution metrics not gated under a lock)")
+        print("-" * 64)
+
+        def fmt(v):
+            if isinstance(v, list):
+                return "[" + " ".join(f"{x:.2f}" for x in v) + "]"
+            if isinstance(v, float):
+                return f"{v:.3f}"
+            return str(v)
+
+        for met in report["metrics"]:
+            if met["gated"]:
+                status = "PASS" if met["pass"] else "FAIL"
+            else:
+                status = "info"
+            print(f"  {met['name']:<22} obs {fmt(met['observed']):<22} exp {fmt(met['expected']):<22} {status}")
+            print(f"  {'':<22} {met['detail']}")
+        print("-" * 64)
+        verdict = "ALL GATED METRICS PASS" if report["all_pass"] else "FIDELITY FAILURES PRESENT"
+        print(f"{report['gated_passed']}/{report['gated_count']} gated metrics pass -- {verdict}")
+        print("=" * 64)
 
     def _generate_recalls(self):
         """Generate recall records."""
@@ -2476,10 +2983,18 @@ class SyntheticDataGenerator:
         print(f"Pay Splits: {len(self.paysplits)}")
         print(f"Claim Procedures: {len(self.claimprocs)}")
         if self.gen_perio:
-            perio_pats = len([p for p in self.patients if p.get("perio") and p["perio"]["stage"] != "healthy"])
+            profiles = [p["perio"] for p in self.patients if p.get("perio")]
+            perio_pats = len([pr for pr in profiles if pr["stage"] != "healthy"])
+            stage_counts = Counter(pr["stage"] for pr in profiles)
+            grade_counts = Counter(pr["grade"] for pr in profiles if pr["stage"] != "healthy")
             print(f"Perio Exams: {len(self.perioexams)}")
             print(f"Perio Measurements: {len(self.periomeasures)}")
             print(f"  - Periodontitis patients (Stage I-IV): {perio_pats}")
+            print(f"  - Stage mix: " + ", ".join(f"{s}={stage_counts.get(s,0)}" for s in PERIO_STAGES))
+            print(f"  - Grade mix (perio): " + ", ".join(f"{g}={grade_counts.get(g,0)}" for g in ("A","B","C")))
+            if self._perio_capture:
+                print(f"  - Ground-truth capture: {len(self.perio_snapshots)} exam snapshots"
+                      + (f", {len(self.perio_labels)} label records" if self.perio_labels else ""))
         print("-"*60)
         print(f"Total SQL statements: {len(self.sql_statements)}")
         print("="*60)
@@ -2518,6 +3033,13 @@ Built by the team at Luna (https://yourluna.co)
                              "(held strictly in-band, no progression to the next stage). Healthy patients are kept.")
     parser.add_argument("--grade", type=str, choices=["A", "B", "C", "a", "b", "c"],
                         help="TEST corner case: force every periodontitis patient to this single 2017 grade.")
+    parser.add_argument("--labels", type=str, default=None, metavar="PATH",
+                        help="Write the ground-truth labels sidecar (per-site noise-free true CAL, true "
+                             "stage/grade/RBL, per-visit truth, derived trajectory & treatment-response) "
+                             "as a JSON file that joins to the SQL via PerioExamNum + tooth.")
+    parser.add_argument("--fidelity-report", nargs="?", const="", default=None, metavar="PATH",
+                        help="Print a statistical-fidelity report (observed cohort vs the epidemiological/"
+                             "clinical literature targets) to stdout; if PATH is given, also write it as JSON.")
 
     args = parser.parse_args()
 
@@ -2534,6 +3056,10 @@ Built by the team at Luna (https://yourluna.co)
     if args.no_perio and (perio_stage or perio_grade):
         print("Warning: --stage/--grade have no effect with --no-perio; ignoring them.")
         perio_stage = perio_grade = None
+    if args.no_perio and (args.labels is not None or args.fidelity_report is not None):
+        print("Warning: --labels/--fidelity-report require perio generation; ignoring with --no-perio.")
+        args.labels = None
+        args.fidelity_report = None
 
     generator = SyntheticDataGenerator(
         seed=args.seed,
@@ -2543,6 +3069,8 @@ Built by the team at Luna (https://yourluna.co)
         gen_perio=not args.no_perio,
         perio_stage=perio_stage,
         perio_grade=perio_grade,
+        gen_labels=args.labels is not None,
+        gen_fidelity=args.fidelity_report is not None,
     )
 
     sql_statements = generator.generate_all()
@@ -2576,6 +3104,22 @@ Built by the team at Luna (https://yourluna.co)
         f.write("\nSET FOREIGN_KEY_CHECKS = 1;\n")
 
     print(f"Done! Generated {len(sql_statements)} SQL statements.")
+
+    # Ground-truth labels sidecar (the SQL's answer key).
+    if generator.gen_labels:
+        generator.write_perio_labels(args.labels)
+
+    # Statistical-fidelity report (observed cohort vs the literature). Non-fatal here -- the
+    # CI gate (tests/check_fidelity.py) is what fails the build on drift.
+    if generator.gen_fidelity:
+        report = generator._perio_fidelity_report()
+        generator._print_fidelity_report(report)
+        if args.fidelity_report:                       # non-empty path -> also write JSON
+            with open(args.fidelity_report, "w") as f:
+                json.dump(report, f, indent=2, default=str)
+            print(f"Fidelity report written to {args.fidelity_report}")
+        if not report["all_pass"]:
+            print("Note: some gated fidelity metrics are outside tolerance (see report above).")
 
 
 if __name__ == "__main__":

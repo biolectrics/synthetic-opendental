@@ -16,11 +16,16 @@ python generate.py --patients 500 --output data.sql
 python generate.py --city "Chicago" --state "IL"   # --state required when --city is given
 python generate.py --seed 12345          # reproducible
 
+python generate.py --labels labels.json           # + ground-truth answer key (JSON)
+python generate.py --fidelity-report fidelity.json # + observed-vs-literature report (stdout + JSON)
+
 mysql -u root -p opendental < synthetic_data.sql   # load into a real OD database
 mysql -u root -p opendental < examples/sample_500_patients.sql  # pre-generated sample
+
+PYTHON=./.venv/bin/python tests/run_qa.sh          # generate fixtures + run the QA suite
 ```
 
-There is **no build, test suite, or linter** — the repo is the one script plus a sample dump. To "verify" a change, run the generator and load the SQL into MySQL (or grep the output). Generated `*.sql` files are gitignored except `examples/*.sql`.
+**QA suite** lives in `tests/` (no pytest; the checkers parse the emitted `.sql`). `run_qa.sh` builds fixtures and runs: `qa_validate.py` (default-mode schema/clinical invariants), `qa_flags.py` (`--stage`/`--grade` locks), `check_labels.py` (labels JSON provably describes the SQL), and `check_fidelity.py` (the fidelity report's gated metrics). It exits non-zero on any failure — this is the regression gate. Otherwise, to spot-check a change, run the generator and grep the output or load it into MySQL. Generated `*.sql` files are gitignored except `examples/*.sql`.
 
 ## Architecture
 
@@ -33,6 +38,12 @@ Everything lives in `generate.py`. Top ~480 lines are module-level **lookup/conf
 **Primary-key counters.** `__init__` sets per-table `self.next_*_num` counters; most start at **10000** (carriers/insplans/providers/operatories at **100**). They start high so the dump can be loaded into an existing OD database without colliding with real rows. Counters only ever increment — never reuse a value.
 
 **Determinism.** `__init__` seeds **both** `random.seed(seed)` and `Faker.seed(seed)`. Same `--seed` + same args ⇒ identical data. Any new code that consumes `random` or `self.fake` must run in a deterministic order (no set iteration, no dict-ordering assumptions across Python versions) or it breaks reproducibility. The only nondeterministic byte is the `datetime.now()` timestamp in the file header.
+
+**Ground-truth capture layer (`--labels` / `--fidelity-report`).** The perio module tracks a noise-free float CAL per site and knows each patient's true stage/grade/trajectory, but the SQL only carries the rounded, encoded *observable* rows. When either flag is set (`self._perio_capture`), `_emit_perio_exam` also appends a per-exam **snapshot** (per-site true CAL vs emitted probing, stage-at-visit, risk tier) to `self.perio_snapshots`, and `_finalize_perio_labels` assembles per-patient label records (attaching the profile and deriving trajectory class + treatment-response). `write_perio_labels` serializes them; `_perio_fidelity_report` / `_print_fidelity_report` compare the cohort against the module's literature-target constants.
+
+- **This capture is pure observation — it draws ZERO `random`/`Faker` values** — so the `.sql` output is **byte-identical** whether or not the flags are set. This is an invariant: never let capture/report code consume RNG, or you desync every existing fixture and seed. (`tests/run_qa.sh` + a same-seed `diff` guard it.)
+- Two samplers were split into pure "compute" + "draw" halves so the report can reuse the exact model math without touching RNG: `_perio_stage_weights` (the report averages these vectors for the model-expected stage mix) and `_perio_risk_tier` (called by both `_perio_recall_days` and the snapshot). Keep the pure halves RNG-free.
+- Fidelity tolerances are **sampling-noise-aware** (`stol()` = ~4 SE of a proportion) so the gate is robust across seeds; distribution/trajectory metrics auto-ungate under a `--stage`/`--grade` lock.
 
 ## Domain rules to preserve
 

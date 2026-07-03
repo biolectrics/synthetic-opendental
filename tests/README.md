@@ -11,8 +11,9 @@ MySQL required).
 PYTHON=./.venv/bin/python tests/run_qa.sh
 ```
 
-This generates fixtures (default mode + the `--stage`/`--grade` corner cases) and runs
-both checkers, exiting non-zero on any failure.
+This generates fixtures (default mode, the `--stage`/`--grade` corner cases, and a larger
+`--labels`/`--fidelity-report` fixture) and runs all four checkers, exiting non-zero on any
+failure.
 
 ## Run a single checker
 
@@ -43,3 +44,20 @@ python tests/qa_flags.py /tmp/fixtures_dir    # flag-mode: stage bounded by CAL,
 - `--stage X` bounds **CAL** to the stage band (never the next stage) while still allowing
   isolated deep pseudopockets; healthy patients are kept.
 - `--grade A` progresses far less than `--grade C` (grade lock controls progression).
+
+**`check_labels.py <sql> <labels.json>`** — integrity of the ground-truth labels sidecar
+(written by `generate.py --labels`) against the emitted SQL. Proves the labels are a
+trustworthy answer key: every labeled `observed_pd_mm` equals the SQL probing exactly, and
+the stored CAL (probing + gingival margin) equals the labeled noise-free true CAL rounded to
+the nearest mm — over *every* charted site. Also checks minors are absent, uncharted patients
+are represented (`charted:false`, null trajectory), join coverage, and that each patient's
+baseline stage matches the labeled true stage.
+
+**`check_fidelity.py <fidelity.json>`** — CI gate on the generator's statistical-fidelity
+report (`generate.py --fidelity-report`). Exits non-zero if any **gated** metric drifts
+outside its (sampling-aware) tolerance: cohort stage mix vs the model-expected distribution,
+periodontitis grade mix + monotone Grade-C-by-stage, smoker/diabetic/compliance prevalence,
+RBL bands and the III/IV apical-third split, per-stage SRP utilization, recall-cadence
+spread, the treated trajectory split (Hirschfeld & Wasserman reference), and the untreated
+A≤B≤C progression ordering. Low-N per-stage cells are reported as *informational*. The
+generator owns the fidelity logic; this script just enforces its verdict.
