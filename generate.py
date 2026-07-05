@@ -39,7 +39,7 @@ from faker import Faker
 
 DEFAULT_SEED = 42
 DEFAULT_PATIENT_COUNT = 750
-GENERATOR_VERSION = "0.3.0"
+GENERATOR_VERSION = "0.5.0"
 
 # Age distribution percentages (based on US dental patient demographics)
 AGE_DISTRIBUTION = [
@@ -643,6 +643,218 @@ PERIO_FIRST_MAINT_MIN_DAYS = 84  # insurance floor: first D4910 >= ~12 weeks aft
 
 
 # =============================================================================
+# MEDICAL HISTORY CONFIGURATION
+# =============================================================================
+# Structured medical history for research-recruitment mining: diseasedef/disease (the
+# problem list), medication/medicationpat, allergydef/allergy -- the tables the Open
+# Dental API exposes as Diseases / MedicationPats / Allergies. Real study screening
+# criteria are mostly medical (diabetes, tobacco, bisphosphonates/MRONJ, anticoagulants,
+# immunosuppression, pregnancy, penicillin allergy), so those must be queryable.
+#
+# TRUTH vs DOCUMENTATION: for each adult the generator first draws what the patient
+# truly has (age/sex-conditioned, roughly NHANES-plausible prevalences; diabetes and
+# tobacco REUSE the perio latents rather than re-drawing), then documents each true
+# condition with probability doc_sens < 1 and each true prescription with
+# MED_DOC_SENSITIVITY -- real problem lists are incomplete while med lists are better
+# maintained (Wright et al. 2015, Int J Med Inform, DOI 10.1016/j.ijmedinf.2015.06.011:
+# problem-list sensitivity 60-99% across sites). labels.json carries BOTH sides, so the
+# recall/precision of any patient-screening query against this data is measurable.
+
+MED_DOC_SENSITIVITY = 0.95      # P(medicationpat row | patient truly takes the drug)
+ALLERGY_DOC_SENSITIVITY = 0.75  # P(allergy row | true allergy) -- Kaboli et al. 2004
+                                # (Am J Manag Care, PMID 15609741): ~23% of allergies
+                                # absent from computerized records.
+
+# RxNorm ingredient-level RxCui values, each verified against RxNav
+# (rxnav.nlm.nih.gov REST /rxcui.json). "notes" -> medication.Notes (drug class);
+# "sig" variants -> medicationpat.PatNote dosage instructions.
+MEDICATION_CATALOG = [
+    {"key": "metformin",           "name": "Metformin",           "rxcui": 6809,    "notes": "Biguanide antidiabetic",                     "sig": ["500 mg, twice daily", "1000 mg, twice daily"]},
+    {"key": "insulin_glargine",    "name": "Insulin Glargine",    "rxcui": 274783,  "notes": "Long-acting insulin",                        "sig": ["20 units at bedtime", "35 units at bedtime"]},
+    {"key": "lisinopril",          "name": "Lisinopril",          "rxcui": 29046,   "notes": "ACE inhibitor",                              "sig": ["10 mg daily", "20 mg daily", "40 mg daily"]},
+    {"key": "amlodipine",          "name": "Amlodipine",          "rxcui": 17767,   "notes": "Calcium channel blocker",                    "sig": ["5 mg daily", "10 mg daily"]},
+    {"key": "hydrochlorothiazide", "name": "Hydrochlorothiazide", "rxcui": 5487,    "notes": "Thiazide diuretic",                          "sig": ["12.5 mg daily", "25 mg daily"]},
+    {"key": "losartan",            "name": "Losartan",            "rxcui": 52175,   "notes": "Angiotensin receptor blocker",               "sig": ["50 mg daily", "100 mg daily"]},
+    {"key": "atorvastatin",        "name": "Atorvastatin",        "rxcui": 83367,   "notes": "HMG-CoA reductase inhibitor (statin)",       "sig": ["20 mg at bedtime", "40 mg at bedtime"]},
+    {"key": "simvastatin",         "name": "Simvastatin",         "rxcui": 36567,   "notes": "HMG-CoA reductase inhibitor (statin)",       "sig": ["20 mg at bedtime", "40 mg at bedtime"]},
+    {"key": "rosuvastatin",        "name": "Rosuvastatin",        "rxcui": 301542,  "notes": "HMG-CoA reductase inhibitor (statin)",       "sig": ["10 mg daily", "20 mg daily"]},
+    {"key": "albuterol",           "name": "Albuterol",           "rxcui": 435,     "notes": "Short-acting beta-2 agonist inhaler",        "sig": ["90 mcg inhaler, 2 puffs PRN", "2 puffs every 4-6 hours as needed"]},
+    {"key": "sertraline",          "name": "Sertraline",          "rxcui": 36437,   "notes": "SSRI; xerostomia risk",                      "sig": ["50 mg daily", "100 mg daily"]},
+    {"key": "fluoxetine",          "name": "Fluoxetine",          "rxcui": 4493,    "notes": "SSRI; xerostomia risk",                      "sig": ["20 mg daily", "40 mg daily"]},
+    {"key": "escitalopram",        "name": "Escitalopram",        "rxcui": 321988,  "notes": "SSRI; xerostomia risk",                      "sig": ["10 mg daily", "20 mg daily"]},
+    {"key": "omeprazole",          "name": "Omeprazole",          "rxcui": 7646,    "notes": "Proton pump inhibitor",                      "sig": ["20 mg daily", "40 mg daily"]},
+    {"key": "pantoprazole",        "name": "Pantoprazole",        "rxcui": 40790,   "notes": "Proton pump inhibitor",                      "sig": ["40 mg daily"]},
+    {"key": "levothyroxine",       "name": "Levothyroxine",       "rxcui": 10582,   "notes": "Thyroid hormone replacement",                "sig": ["75 mcg daily", "100 mcg daily", "125 mcg daily"]},
+    {"key": "alendronate",         "name": "Alendronate",         "rxcui": 46041,   "notes": "Bisphosphonate; MRONJ risk",                 "sig": ["70 mg weekly"]},
+    {"key": "apixaban",            "name": "Apixaban",            "rxcui": 1364430, "notes": "DOAC anticoagulant; bleeding risk",          "sig": ["5 mg twice daily", "2.5 mg twice daily"]},
+    {"key": "warfarin",            "name": "Warfarin",            "rxcui": 11289,   "notes": "Vitamin K antagonist; bleeding risk",        "sig": ["5 mg daily, INR monitored", "2.5 mg daily, INR monitored"]},
+    {"key": "rivaroxaban",         "name": "Rivaroxaban",         "rxcui": 1114195, "notes": "DOAC anticoagulant; bleeding risk",          "sig": ["20 mg daily with food"]},
+    {"key": "aspirin",             "name": "Aspirin",             "rxcui": 1191,    "notes": "Antiplatelet",                               "sig": ["81 mg daily"]},
+    {"key": "metoprolol",          "name": "Metoprolol",          "rxcui": 6918,    "notes": "Beta blocker",                               "sig": ["25 mg twice daily", "50 mg twice daily"]},
+    {"key": "methotrexate",        "name": "Methotrexate",        "rxcui": 6851,    "notes": "DMARD; immunosuppressant",                   "sig": ["15 mg weekly with folic acid", "20 mg weekly with folic acid"]},
+    {"key": "ibuprofen",           "name": "Ibuprofen",           "rxcui": 5640,    "notes": "NSAID",                                      "sig": ["400 mg as needed for pain", "600 mg three times daily as needed"]},
+    {"key": "prednisone",          "name": "Prednisone",          "rxcui": 8640,    "notes": "Corticosteroid",                             "sig": ["5 mg daily", "10 mg daily, taper"]},
+    {"key": "clopidogrel",         "name": "Clopidogrel",         "rxcui": 32968,   "notes": "Antiplatelet (P2Y12); bleeding risk",        "sig": ["75 mg daily"]},
+    # Short-course / independent prescriptions (antibiotics, antibacterial rinses,
+    # gingival-hyperplasia drugs) -- prescribed via _generate_independent_prescriptions,
+    # NOT indicated by a chronic condition. They back the OraFlow-US-003 exclusions
+    # EX13 (recent systemic antibiotics), IC6 (antibacterial rinse switch), EX12 (drugs
+    # causing gingival hyperplasia).
+    {"key": "amoxicillin",         "name": "Amoxicillin",         "rxcui": 723,     "notes": "Aminopenicillin antibiotic",                 "sig": ["500 mg three times daily x7 days", "875 mg twice daily x10 days"]},
+    {"key": "doxycycline",         "name": "Doxycycline",         "rxcui": 3640,    "notes": "Tetracycline antibiotic",                    "sig": ["100 mg twice daily x7 days"]},
+    {"key": "azithromycin",        "name": "Azithromycin",        "rxcui": 18631,   "notes": "Macrolide antibiotic",                       "sig": ["500 mg day 1 then 250 mg daily x4 days"]},
+    {"key": "metronidazole",       "name": "Metronidazole",       "rxcui": 6922,    "notes": "Nitroimidazole antibiotic",                  "sig": ["500 mg three times daily x7 days"]},
+    {"key": "clindamycin",         "name": "Clindamycin",         "rxcui": 2582,    "notes": "Lincosamide antibiotic",                     "sig": ["300 mg three times daily x7 days"]},
+    {"key": "chlorhexidine_rinse", "name": "Chlorhexidine Gluconate 0.12% Rinse", "rxcui": 20791, "notes": "Antibacterial oral rinse (chlorhexidine gluconate)", "sig": ["Rinse 15 mL twice daily"]},
+    {"key": "cpc_rinse",           "name": "Cetylpyridinium Chloride Rinse",      "rxcui": 2287,  "notes": "Antibacterial oral rinse (cetylpyridinium chloride)", "sig": ["Rinse twice daily"]},
+    {"key": "phenytoin",           "name": "Phenytoin",           "rxcui": 8183,    "notes": "Anticonvulsant; causes gingival hyperplasia", "sig": ["100 mg three times daily"]},
+    {"key": "cyclosporine",        "name": "Cyclosporine",        "rxcui": 3008,    "notes": "Immunosuppressant; causes gingival hyperplasia", "sig": ["100 mg twice daily"]},
+]
+
+# Independent (non-condition-indicated) prescriptions drawn per adult. Each entry:
+# class label, member med keys (one picked), per-patient prevalence, and the DateStart
+# window (days-ago lo, hi). Antibiotic/hyperplasia windows deliberately straddle the
+# protocol's 3-month (91-day) exclusion look-back so both sides are represented.
+INDEPENDENT_RX = [
+    {"class": "antibiotic", "meds": ["amoxicillin", "doxycycline", "azithromycin", "metronidazole", "clindamycin"],
+     "prev": 0.11, "window": (5, 240)},
+    {"class": "antibacterial_rinse", "meds": ["chlorhexidine_rinse", "cpc_rinse"],
+     "prev": 0.06, "window": (10, 400), "perio_bonus": 0.10},   # +10% if periodontitis
+    {"class": "hyperplasia_drug", "meds": ["phenytoin", "cyclosporine"],
+     "prev": 0.015, "window": (200, 1500)},
+]
+
+# Condition catalog. Each entry: ICD-10 + SNOMED CT (spot-verified against tx.fhir.org),
+# doc_sens = P(problem-list row | true condition), meds = [(med_key_or_choice_list,
+# rx_prob)] where a list means "one drug picked uniformly from the class", and prob =
+# TRUE prevalence as a function of (age, female, perio_profile, truth_so_far). Entries
+# whose prob reads `truth` (t1dm, copd) must come after the entries they depend on --
+# the catalog is drawn strictly in order, one RNG draw per condition per patient.
+def _age_band(age: int, under40: float, forties_fifties: float, sixty_plus: float) -> float:
+    return under40 if age < 40 else (forties_fifties if age < 60 else sixty_plus)
+
+
+DISEASE_CATALOG = [
+    {"key": "t2dm", "name": "Type 2 diabetes mellitus", "icd10": "E11.9", "snomed": "44054006",
+     "doc_sens": 0.80, "meds": [("metformin", 0.70), ("insulin_glargine", 0.20)],
+     "prob": lambda age, female, perio, truth: 0.93 if perio["diabetic"] else 0.0},
+    {"key": "t1dm", "name": "Type 1 diabetes mellitus", "icd10": "E10.9", "snomed": "46635009",
+     "doc_sens": 0.90, "meds": [("insulin_glargine", 0.98)],
+     "prob": lambda age, female, perio, truth: 1.0 if perio["diabetic"] and "t2dm" not in truth else 0.0},
+    {"key": "tobacco", "name": "Nicotine dependence, cigarettes", "icd10": "F17.210", "snomed": "449868002",
+     "doc_sens": 0.75, "meds": [],
+     "prob": lambda age, female, perio, truth: 1.0 if perio["smoker"] else 0.0},
+    {"key": "former_smoker", "name": "Personal history of nicotine dependence", "icd10": "Z87.891", "snomed": "8517006",
+     "doc_sens": 0.60, "meds": [],
+     "prob": lambda age, female, perio, truth: 0.0 if perio["smoker"] else _age_band(age, 0.12, 0.22, 0.32)},
+    {"key": "htn", "name": "Essential hypertension", "icd10": "I10", "snomed": "38341003",
+     "doc_sens": 0.85, "meds": [(["lisinopril", "amlodipine", "losartan", "hydrochlorothiazide"], 0.85),
+                                (["lisinopril", "amlodipine", "losartan", "hydrochlorothiazide"], 0.25)],
+     "prob": lambda age, female, perio, truth: min(0.85, _age_band(age, 0.10, 0.33, 0.60) * (1.4 if perio["diabetic"] else 1.0))},
+    {"key": "hld", "name": "Hyperlipidemia", "icd10": "E78.5", "snomed": "55822004",
+     "doc_sens": 0.75, "meds": [(["atorvastatin", "simvastatin", "rosuvastatin"], 0.80)],
+     "prob": lambda age, female, perio, truth: _age_band(age, 0.12, 0.30, 0.45)},
+    {"key": "asthma", "name": "Asthma", "icd10": "J45.909", "snomed": "195967001",
+     "doc_sens": 0.80, "meds": [("albuterol", 0.85)],
+     "prob": lambda age, female, perio, truth: 0.08},
+    {"key": "depression", "name": "Major depressive disorder", "icd10": "F32.9", "snomed": "35489007",
+     "doc_sens": 0.70, "meds": [(["sertraline", "fluoxetine", "escitalopram"], 0.85)],
+     "prob": lambda age, female, perio, truth: 0.09},
+    {"key": "anxiety", "name": "Anxiety disorder", "icd10": "F41.9", "snomed": "197480006",
+     "doc_sens": 0.65, "meds": [(["escitalopram", "sertraline"], 0.50)],
+     "prob": lambda age, female, perio, truth: 0.10},
+    {"key": "gerd", "name": "Gastroesophageal reflux disease", "icd10": "K21.9", "snomed": "235595009",
+     "doc_sens": 0.70, "meds": [(["omeprazole", "pantoprazole"], 0.75)],
+     "prob": lambda age, female, perio, truth: 0.18},
+    {"key": "hypothyroid", "name": "Hypothyroidism", "icd10": "E03.9", "snomed": "40930008",
+     "doc_sens": 0.85, "meds": [("levothyroxine", 0.95)],
+     "prob": lambda age, female, perio, truth: 0.08 if female else 0.025},
+    {"key": "osteoporosis", "name": "Osteoporosis", "icd10": "M81.0", "snomed": "64859006",
+     "doc_sens": 0.80, "meds": [("alendronate", 0.40)],       # MRONJ exclusion criterion
+     "prob": lambda age, female, perio, truth:
+         (0.20 if age >= 65 else 0.07 if age >= 50 else 0.0) if female else (0.05 if age >= 65 else 0.0)},
+    {"key": "afib", "name": "Atrial fibrillation", "icd10": "I48.91", "snomed": "49436004",
+     "doc_sens": 0.85, "meds": [(["apixaban", "warfarin", "rivaroxaban"], 0.90),   # bleeding-risk criterion
+                                ("metoprolol", 0.50)],
+     "prob": lambda age, female, perio, truth: 0.07 if age >= 60 else (0.02 if age >= 45 else 0.0)},
+    {"key": "cad", "name": "Coronary artery disease", "icd10": "I25.10", "snomed": "53741008",
+     "doc_sens": 0.80, "meds": [("aspirin", 0.80), ("atorvastatin", 0.70), ("metoprolol", 0.50),
+                                ("clopidogrel", 0.25)],   # antiplatelet -> EX15
+     "prob": lambda age, female, perio, truth: min(0.40, (0.0 if age < 45 else 0.05 if age < 60 else 0.12)
+                                                   * (1.5 if perio["smoker"] else 1.0) * (1.5 if perio["diabetic"] else 1.0))},
+    {"key": "oa", "name": "Osteoarthritis", "icd10": "M19.90", "snomed": "396275006",
+     "doc_sens": 0.60, "meds": [("ibuprofen", 0.30)],
+     "prob": lambda age, female, perio, truth: _age_band(age, 0.02, 0.15, 0.35)},
+    {"key": "prosthetic_joint", "name": "Presence of artificial knee joint", "icd10": "Z96.651", "snomed": "911000119102",
+     "doc_sens": 0.70, "meds": [],                             # antibiotic-premedication criterion
+     "prob": lambda age, female, perio, truth: 0.09 if age >= 60 else 0.0},
+    {"key": "ra", "name": "Rheumatoid arthritis", "icd10": "M06.9", "snomed": "69896004",
+     "doc_sens": 0.85, "meds": [("methotrexate", 0.60), ("prednisone", 0.25)],   # immunosuppression criterion
+     "prob": lambda age, female, perio, truth: 0.014 if female else 0.007},
+    {"key": "ckd3", "name": "Chronic kidney disease, stage 3", "icd10": "N18.30", "snomed": "433144002",
+     "doc_sens": 0.55, "meds": [],
+     "prob": lambda age, female, perio, truth: min(0.30, 0.10 * (1.8 if perio["diabetic"] else 1.0)) if age >= 60 else 0.0},
+    {"key": "copd", "name": "Chronic obstructive pulmonary disease", "icd10": "J44.9", "snomed": "13645005",
+     "doc_sens": 0.80, "meds": [("albuterol", 0.70)],
+     "prob": lambda age, female, perio, truth:
+         0.15 if age >= 45 and (perio["smoker"] or "former_smoker" in truth) else 0.0},
+    {"key": "osa", "name": "Obstructive sleep apnea", "icd10": "G47.33", "snomed": "78275009",
+     "doc_sens": 0.65, "meds": [],
+     "prob": lambda age, female, perio, truth: (0.05 if female else 0.10) * (0.5 if age < 40 else 1.0)},
+    {"key": "pregnancy", "name": "Pregnant state", "icd10": "Z33.1", "snomed": "77386006",
+     "doc_sens": 0.85, "meds": [],                             # universal exclusion criterion
+     "prob": lambda age, female, perio, truth: 0.035 if female and age <= 45 else 0.0},
+    # OraFlow-US-003-specific exclusion conditions (added v0.5.0):
+    {"key": "cancer", "name": "Malignant neoplasm", "icd10": "C80.1", "snomed": "363346000",
+     "doc_sens": 0.90, "meds": [],                             # EX10 (only ACTIVE/uncontrolled excludes)
+     "prob": lambda age, female, perio, truth: _age_band(age, 0.01, 0.03, 0.08)},
+    {"key": "pacemaker", "name": "Cardiac implantable electronic device in situ", "icd10": "Z95.0", "snomed": "441509002",
+     "doc_sens": 0.85, "meds": [],                             # EX16 device contraindication; premed-adjacent
+     "prob": lambda age, female, perio, truth: 0.06 if age >= 65 else (0.02 if age >= 50 else 0.0)},
+    {"key": "heart_valve", "name": "Prosthetic heart valve in situ", "icd10": "Z95.2", "snomed": "737277001",
+     "doc_sens": 0.85, "meds": [],                             # EX6 antibiotic-prophylaxis (AHA high-risk)
+     "prob": lambda age, female, perio, truth: 0.02 if age >= 60 else 0.0},
+    {"key": "tmd", "name": "Temporomandibular joint disorder", "icd10": "M26.60", "snomed": "41888000",
+     "doc_sens": 0.65, "meds": [],                             # EX7 limited opening / TMD
+     "prob": lambda age, female, perio, truth: (0.07 if female else 0.03)},
+]
+
+# Conditions that carry a controlled/uncontrolled status. Only the UNCONTROLLED form
+# trips OraFlow exclusion EX10; the status is written to disease.PatNote and carried in
+# labels. Value = P(uncontrolled | condition true).
+UNCONTROLLED_PROB = {"t2dm": 0.28, "t1dm": 0.30, "htn": 0.20, "cancer": 0.45}
+# Conditions that clinically require antibiotic prophylaxis before dental treatment
+# (OraFlow EX6). Presence of any -> IC/EX evaluator marks prophylaxis-required.
+PREMED_CONDITIONS = {"prosthetic_joint", "heart_valve"}
+# Drugs whose presence triggers the "affects gingival conditions" exclusion (EX12).
+GINGIVAL_HYPERPLASIA_MEDS = {"phenytoin", "cyclosporine", "amlodipine"}
+# Anticoagulant/antiplatelet drugs named or implied by EX15 (81 mg ASA is permitted and
+# is handled separately by dose, so aspirin is NOT in this set).
+ANTICOAGULANT_MEDS = {"warfarin", "apixaban", "rivaroxaban", "clopidogrel"}
+# Systemic antibiotics (EX13, 3-month look-back).
+ANTIBIOTIC_MEDS = {"amoxicillin", "doxycycline", "azithromycin", "metronidazole", "clindamycin"}
+# Antibacterial oral rinses the subject must agree to switch off (IC6).
+ANTIBACTERIAL_RINSE_MEDS = {"chlorhexidine_rinse", "cpc_rinse"}
+
+# Allergy catalog. prev = TRUE prevalence; each true allergy is documented with
+# ALLERGY_DOC_SENSITIVITY. Reactions are weighted; anaphylaxis is deliberately rare.
+ALLERGY_CATALOG = [
+    {"key": "penicillin",  "name": "Penicillin",          "prev": 0.100,
+     "reactions": [("Hives", 5), ("Rash", 4), ("Swelling", 2), ("Anaphylaxis", 1)]},
+    {"key": "sulfa",       "name": "Sulfa antibiotics",   "prev": 0.035,
+     "reactions": [("Rash", 5), ("Hives", 3), ("GI upset", 2)]},
+    {"key": "codeine",     "name": "Codeine",             "prev": 0.030,
+     "reactions": [("Nausea and vomiting", 5), ("GI upset", 3), ("Rash", 1)]},
+    {"key": "latex",       "name": "Latex",               "prev": 0.020,
+     "reactions": [("Contact dermatitis", 5), ("Hives", 3), ("Swelling", 1)]},
+    {"key": "amoxicillin", "name": "Amoxicillin",         "prev": 0.015,
+     "reactions": [("Rash", 5), ("Hives", 3), ("Swelling", 1)]},
+    {"key": "nsaids",      "name": "NSAIDs (ibuprofen)",  "prev": 0.010,
+     "reactions": [("GI upset", 4), ("Hives", 2), ("Swelling", 1)]},
+]
+
+
+# =============================================================================
 # SQL GENERATION HELPERS
 # =============================================================================
 
@@ -675,7 +887,7 @@ def generate_insert(table: str, columns: list[str], values: list[Any]) -> str:
 class SyntheticDataGenerator:
     def __init__(self, seed: int = DEFAULT_SEED, city: str = None, state: str = None, patient_count: int = DEFAULT_PATIENT_COUNT,
                  gen_perio: bool = True, perio_stage: str = None, perio_grade: str = None,
-                 gen_labels: bool = False, gen_fidelity: bool = False):
+                 gen_labels: bool = False, gen_fidelity: bool = False, gen_medical: bool = True):
         self.seed = seed
         self.patient_count = patient_count
         self.gen_perio = gen_perio
@@ -692,6 +904,9 @@ class SyntheticDataGenerator:
         self.gen_labels = gen_labels and gen_perio
         self.gen_fidelity = gen_fidelity and gen_perio
         self._perio_capture = self.gen_labels or self.gen_fidelity
+        # Medical history (problem list / medications / allergies) reads the perio
+        # latents (smoker/diabetic), so it requires the perio module.
+        self.gen_medical = gen_medical and gen_perio
         random.seed(seed)
         Faker.seed(seed)
         self.fake = Faker('en_US')
@@ -725,6 +940,15 @@ class SyntheticDataGenerator:
         self.next_patplan_num = 10000
         self.next_perioexam_num = 10000
         self.next_periomeasure_num = 10000
+        # Medical-history tables. Def tables also start at 10000 (not 100 like
+        # carriers/insplans): real practices commonly carry >100 diseasedef/medication
+        # rows, so 100 would risk colliding when loading into an existing database.
+        self.next_diseasedef_num = 10000
+        self.next_disease_num = 10000
+        self.next_medication_num = 10000
+        self.next_medicationpat_num = 10000
+        self.next_allergydef_num = 10000
+        self.next_allergy_num = 10000
 
         # Data storage
         self.providers = []
@@ -744,6 +968,12 @@ class SyntheticDataGenerator:
         self.claimprocs = []
         self.perioexams = []
         self.periomeasures = []
+        self.diseasedefs = []
+        self.diseases = []
+        self.medications = []
+        self.medicationpats = []
+        self.allergydefs = []
+        self.allergies = []
         # Ground-truth capture (populated only when self._perio_capture): one snapshot
         # dict per emitted exam; finalized into per-patient label records.
         self.perio_snapshots = []
@@ -794,11 +1024,18 @@ class SyntheticDataGenerator:
         self._generate_appointments_and_procedures()
         if self.gen_perio:
             self._generate_perio()
-            if self._perio_capture:
-                self._finalize_perio_labels()   # trajectory/response labels; used by both flags
         self._generate_recalls()
         self._generate_commlogs()
         self._generate_payments()
+        # Medical history runs at the TAIL on purpose: it draws its own RNG after every
+        # other module's draws, so enabling/disabling it (or changing its catalog) never
+        # shifts the bytes of any table above -- only the appended rows change.
+        if self.gen_medical:
+            self._generate_medical_history()
+            self._generate_study_signals()   # declined-SRP recruitment pool (IC4)
+        if self.gen_perio and self._perio_capture:
+            self._finalize_perio_labels()   # pure post-processing (no RNG); runs after
+                                            # medical history so labels can attach it
 
         # Print summary stats
         self._print_stats()
@@ -1104,6 +1341,19 @@ class SyntheticDataGenerator:
         # Text message OK
         txt_msg_ok = random.choices([0, 1, 2], weights=[0.1, 0.7, 0.2])[0]
 
+        # Contact preferences -- PURE functions of the fields already drawn above.
+        # Do NOT add RNG draws here: any new draw shifts every downstream draw and
+        # desyncs all fixtures/seeds. ContactMethod enum: 0=None 1=DoNotCall 2=HmPhone
+        # 3=WkPhone 4=WirelessPh 5=Email 6=SeeNotes 7=Mail 8=TextMessage.
+        if txt_msg_ok == 1 and wireless and age < 75:
+            prefer_contact = 8              # TextMessage
+        elif email:
+            prefer_contact = 5              # Email
+        else:
+            prefer_contact = 2              # HmPhone
+        prefer_confirm = prefer_contact
+        prefer_recall = 5 if email else 7   # recall cards: email if available, else mail
+
         patient = {
             "PatNum": pat_num,
             "LName": lname,
@@ -1134,6 +1384,9 @@ class SyntheticDataGenerator:
             "DateFirstVisit": date_first_visit,
             "ClinicNum": 0,
             "TxtMsgOk": txt_msg_ok,
+            "PreferContactMethod": prefer_contact,
+            "PreferConfirmMethod": prefer_confirm,
+            "PreferRecallMethod": prefer_recall,
             "Age": age,  # Not stored in DB, used for logic
         }
 
@@ -1144,11 +1397,13 @@ class SyntheticDataGenerator:
             ["PatNum", "LName", "FName", "MiddleI", "Preferred", "PatStatus", "Gender", "Position",
              "Birthdate", "SSN", "Address", "Address2", "City", "State", "Zip",
              "HmPhone", "WkPhone", "WirelessPhone", "Email", "Guarantor", "PriProv", "SecProv",
-             "FeeSched", "BillingType", "EstBalance", "BalTotal", "DateFirstVisit", "ClinicNum", "TxtMsgOk"],
+             "FeeSched", "BillingType", "EstBalance", "BalTotal", "DateFirstVisit", "ClinicNum", "TxtMsgOk",
+             "PreferContactMethod", "PreferConfirmMethod", "PreferRecallMethod"],
             [pat_num, lname, fname, middle_i, preferred, 0, gender, position,
              birthdate, ssn, address, "", city, state, zip_code,
              hm_phone, wk_phone, wireless, email, guarantor, pri_prov, sec_prov,
-             0, DEFAULT_BILLING_TYPE, est_balance, bal_total, date_first_visit, 0, txt_msg_ok]
+             0, DEFAULT_BILLING_TYPE, est_balance, bal_total, date_first_visit, 0, txt_msg_ok,
+             prefer_contact, prefer_confirm, prefer_recall]
         ))
 
         return patient
@@ -2026,13 +2281,19 @@ class SyntheticDataGenerator:
             # regardless of the 1..12 probing clamp. margin = round(CAL) - PD.
             pd = [self._site_pd(t, i) for i in range(6)]
             margin = [int(round(t["cal"][i])) - pd[i] for i in range(6)]
+            # Bleeding computed once here (its RNG draw is the first in this tooth's
+            # block, so moving it above the snapshot preserves draw order) and reused
+            # for both the snapshot BOP flags and the emitted row.
+            bleed = self._perio_bleed_surfaces(t, inflammation, bop)
             if teeth_snap is not None:
-                # Noise-free truth vs the emitted (rounded/clamped) probing, per site.
+                # Noise-free truth vs the emitted (rounded/clamped) probing, per site,
+                # plus per-site BOP -- needed for the OraFlow "BOP + PD>=4mm" site count.
                 teeth_snap[tooth] = {
                     "true_cal_mm": [round(t["cal"][i], 3) for i in range(6)],
                     "observed_pd_mm": list(pd),
                     "recession_mm": list(t["rec"]),
                     "swell": list(t["swell"]),
+                    "bop": [bool(v & PERIO_FLAG_BLEED) for v in bleed],
                 }
             # Probing depth (always)
             self._create_periomeasure(exam_num, exam_dt, PERIO_SEQ_PROBING, tooth, PERIO_NO_MEASURE, pd)
@@ -2040,8 +2301,7 @@ class SyntheticDataGenerator:
             ging_enc = [v if v >= 0 else 100 + (-v) for v in margin]
             self._create_periomeasure(exam_num, exam_dt, PERIO_SEQ_GINGMARGIN, tooth, PERIO_NO_MEASURE, ging_enc)
             # Bleeding/suppuration/plaque/calculus (always)
-            self._create_periomeasure(exam_num, exam_dt, PERIO_SEQ_BLEEDING, tooth, PERIO_NO_MEASURE,
-                                      self._perio_bleed_surfaces(t, inflammation, bop))
+            self._create_periomeasure(exam_num, exam_dt, PERIO_SEQ_BLEEDING, tooth, PERIO_NO_MEASURE, bleed)
             if full:
                 # Mucogingival junction; maxillary lingual sites left -1
                 m = t["mgj"]
@@ -2081,6 +2341,7 @@ class SyntheticDataGenerator:
                 "risk_tier": tier,
                 "stage_at_visit": self._stage_from_cal(self._chart_worst_cal(chart)),
                 "worst_true_cal_mm": round(worst_true, 3),
+                "max_mobility": max((tt["mob"] for tt in chart.values()), default=0),
                 "teeth": teeth_snap,
             })
         return exam_num
@@ -2301,6 +2562,118 @@ class SyntheticDataGenerator:
 
         print(f"    Created {len(self.perioexams)} perio exams, {len(self.periomeasures)} measurements")
 
+    # OraFlow-US-003 protocol constants (v13, 2026-06-30).
+    PROTOCOL_ID = "OraFlow-US-003 v13"
+    _NOT_EVALUABLE = [
+        "IC6_rinse_consent", "IC7_selfcare", "IC8_icf", "IC9_compliance",
+        "EX3_ortho", "EX4_amalgam_margin", "EX8_oral_lesions",
+        "EX17_periimplant", "EX18_other_study", "EX19_investigator",
+    ]
+
+    def _evaluate_eligibility(self, patient: dict, exams: list, procs: list) -> dict:
+        """Evaluate the OraFlow-US-003 inclusion/exclusion criteria against GROUND TRUTH --
+        the study answer key. Pure (no RNG): reads the patient's latent profile, the medical
+        truth captured by _generate_medical_history, the exam snapshots, and the patient's
+        procedures. `eligible` = every EVALUABLE inclusion met AND no evaluable exclusion
+        triggered; consent/behavioral and unmodeled criteria are listed as not_evaluable.
+        A screening query run on the SQL sees only the *documented* subset, so scoring it
+        against this key measures a recruitment tool's recall/precision (see
+        tests/score_eligibility.py)."""
+        age, female = patient["Age"], patient["Gender"] == 1
+        profile = patient["perio"]
+        med = patient.get("medical", {})
+        true_conds = {c["key"]: c for c in med.get("true_conditions", [])}
+        true_meds = {m["key"] for m in med.get("true_medications", [])}
+        recent = med.get("recent_medications", [])
+
+        # Screening assesses CURRENT status, so IC3/IC5/EX5 use the most RECENT exam
+        # (exams are sorted chronologically) -- not the earliest historical chart, which
+        # for a treated-then-resolved or a progressed patient no longer reflects reality.
+        current = exams[-1] if exams else None
+        qualifying = 0
+        n_teeth = 0
+        quad_counts = {q: 0 for q in QUADRANTS}
+        max_mob = 0
+        if current:
+            for tnum, t in current["teeth"].items():
+                n_teeth += 1
+                quad_counts[_tooth_quadrant(int(tnum))] += 1
+                for i in range(6):
+                    if t["observed_pd_mm"][i] >= 4 and t["bop"][i]:
+                        qualifying += 1
+            max_mob = current.get("max_mobility", 0)
+
+        # Procedure-window checks (days relative to self.today).
+        def days_ago(d):
+            return (self.today - d).days
+        completed_srp = any(p["ProcCode"] in ("D4341", "D4342") and p["ProcStatus"] == 2
+                            and 0 <= days_ago(p["ProcDate"]) <= 91 for p in procs)
+        recent_surgery = any(p["ProcCode"] in ("D4260", "D4261") and p["ProcStatus"] == 2
+                             and 0 <= days_ago(p["ProcDate"]) <= 182 for p in procs)
+        recent_prophy = any(p["ProcCode"] == "D1110" and p["ProcStatus"] == 2
+                            and 0 <= days_ago(p["ProcDate"]) <= 91 for p in procs)
+        has_tp_srp = any(p["ProcCode"] in ("D4341", "D4342") and p["ProcStatus"] == 1 for p in procs)
+
+        # --- Inclusion criteria (all evaluable ones must pass) ---
+        failed_inclusion = []
+        if not (22 <= age <= 75):
+            failed_inclusion.append("IC1_age")
+        if not (profile["stage"] in ("I", "II", "III") and profile["grade"] in ("A", "B")):
+            failed_inclusion.append("IC2_stage_grade")
+        if qualifying < 8:
+            failed_inclusion.append("IC3_sites")
+        if not has_tp_srp:            # a standing SRP recommendation the subject declined
+            failed_inclusion.append("IC4_declined_srp")   # recency handled by EX1
+        if not (n_teeth >= 18 and all(quad_counts[q] >= 2 for q in QUADRANTS)):
+            failed_inclusion.append("IC5_teeth")
+
+        # --- Exclusion criteria (any evaluable trigger disqualifies) ---
+        triggered = []
+        if completed_srp or recent_surgery:
+            triggered.append("EX1_recent_srp_surgery")
+        if recent_prophy:
+            triggered.append("EX2_recent_prophy")
+        if max_mob > 2:
+            triggered.append("EX5_mobility")
+        if PREMED_CONDITIONS & set(true_conds):
+            triggered.append("EX6_premed")
+        if "tmd" in true_conds:
+            triggered.append("EX7_tmd")
+        if profile["smoker"] or "tobacco" in true_conds:
+            triggered.append("EX9_tobacco")
+        if any(true_conds[k].get("controlled") is False for k in ("t2dm", "t1dm", "htn", "cancer")
+               if k in true_conds):
+            triggered.append("EX10_uncontrolled")
+        if "pregnancy" in true_conds:
+            triggered.append("EX11_pregnancy")
+        if (GINGIVAL_HYPERPLASIA_MEDS & true_meds) or any(r["class"] == "hyperplasia_drug" for r in recent):
+            triggered.append("EX12_hyperplasia_med")
+        if any(r["class"] == "antibiotic" and r["days_ago"] <= 91 for r in recent):
+            triggered.append("EX13_antibiotics")
+        # EX14 = corticosteroid or NSAID on a REGULAR basis. Prednisone is modeled as
+        # daily; ibuprofen is modeled PRN ("as needed", not regular) so it does NOT
+        # trigger, and 81 mg ASA is explicitly permitted -- so aspirin is excluded too.
+        if "prednisone" in true_meds:
+            triggered.append("EX14_steroid_nsaid")
+        if ANTICOAGULANT_MEDS & true_meds:
+            triggered.append("EX15_anticoagulant")
+        if "pacemaker" in true_conds:
+            triggered.append("EX16_cardiac_device")
+
+        on_rinse = any(r["class"] == "antibacterial_rinse" for r in recent)
+        return {
+            "protocol": self.PROTOCOL_ID,
+            "eligible": (not failed_inclusion) and (not triggered),
+            "qualifying_site_count": qualifying,
+            "natural_teeth": n_teeth,
+            "true_stage": profile["stage"],
+            "true_grade": profile["grade"],
+            "failed_inclusion": failed_inclusion,
+            "triggered_exclusion": triggered,
+            "on_antibacterial_rinse": on_rinse,   # IC6: not disqualifying (must switch)
+            "not_evaluable": self._NOT_EVALUABLE,
+        }
+
     @staticmethod
     def _rbl_third(pct: int) -> str:
         """Radiographic-bone-loss third (structured label). Uses the 2017 staging bands:
@@ -2387,6 +2760,9 @@ class SyntheticDataGenerator:
         by_pat = defaultdict(list)
         for s in self.perio_snapshots:
             by_pat[s["PatNum"]].append(s)
+        procs_by_pat = defaultdict(list)                  # for the eligibility evaluator
+        for pr in self.procedures:
+            procs_by_pat[pr["PatNum"]].append(pr)
 
         self.perio_labels = []
         for patient in self.patients:                     # deterministic order; minors skipped
@@ -2401,7 +2777,7 @@ class SyntheticDataGenerator:
                 present = sorted(baseline_teeth)
             else:                                          # profiled but never charted
                 present, lost = sorted(profile["teeth"]), []
-            self.perio_labels.append({
+            record = {
                 "PatNum": patient["PatNum"],
                 "age": patient["Age"],
                 "gender": patient["Gender"],
@@ -2419,8 +2795,21 @@ class SyntheticDataGenerator:
                     "teeth_lost_to_perio": lost,
                 },
                 "trajectory": self._derive_trajectory(profile, exams),
-                "exams": exams,
-            })
+            }
+            # Medical history (true vs documented) rides in the same record when the
+            # medical module ran. Contact prefs come straight off the patient row.
+            if self.gen_medical and "medical" in patient:
+                med = dict(patient["medical"])
+                med["contact"] = {
+                    "prefer_contact_method": patient["PreferContactMethod"],
+                    "txt_msg_ok": patient["TxtMsgOk"],
+                }
+                record["medical"] = med
+                # OraFlow-US-003 study-eligibility answer key (needs the medical truth).
+                record["study_eligibility"] = self._evaluate_eligibility(
+                    patient, exams, procs_by_pat.get(patient["PatNum"], []))
+            record["exams"] = exams
+            self.perio_labels.append(record)
 
     # Ground-truth field documentation embedded in the labels file's meta block.
     _LABEL_CITATIONS = [
@@ -2430,6 +2819,13 @@ class SyntheticDataGenerator:
         "Loe et al. 1986 (natural history of periodontitis)",
         "Hirschfeld & Wasserman 1978, J Periodontol 49(5):225 (long-term maintenance outcomes)",
         "Lang & Tonetti Periodontal Risk Assessment; AAP/EFP grade-to-recall mapping",
+        "Wright et al. 2015, Int J Med Inform 84(10):784 (EHR problem-list completeness 60-99%), "
+        "DOI 10.1016/j.ijmedinf.2015.06.011",
+        "Kaboli et al. 2004, Am J Manag Care 10(11 Pt 2):872 (PMID 15609741; ~23% of allergies "
+        "and 25% of medications missing from computerized records)",
+        "NHANES / CDC prevalence estimates for the modeled comorbidities",
+        "Biolectrics OraFlow-US-003 Confirmatory Study protocol v13 (2026-06-30) -- "
+        "inclusion/exclusion criteria for the study_eligibility answer key",
     ]
     _LABEL_DEFINITIONS = {
         "profile.true_stage": "2017 stage the patient was generated as (healthy, I-IV); ground truth, NOT inferred from measurements.",
@@ -2444,14 +2840,23 @@ class SyntheticDataGenerator:
         "exams[].risk_tier": "Recommended-recall risk tier at that visit (very_high/high/moderate/low).",
         "exams[].teeth[tooth].true_cal_mm": "Per-site noise-free CAL, 6 sites in order MB,B,DB,ML,L,DL.",
         "exams[].teeth[tooth].observed_pd_mm": "Emitted probing depth in the SQL for the same site; observed = round(true_cal) - recession + swell, clamped 1..12.",
-        "_join": "exams[].PerioExamNum + tooth number -> SQL periomeasure rows (SequenceType 4 = probing, 2 = gingival margin).",
+        "medical.true_conditions": "Every condition the patient TRULY has (ground truth), with ICD-10 + SNOMED and onset date. Not all are documented.",
+        "medical.documented_conditions": "Subset written to the SQL `disease` (problem-list) table; join on DiseaseNum. documented is a subset of true (problem-list incompleteness, Wright 2015).",
+        "medical.true_medications": "Every drug the patient TRULY takes, with the indicating condition (rx_for). Superset of the documented med rows.",
+        "medical.documented_medications": "Subset written to the SQL `medicationpat` table; join on MedicationPatNum. RxCui matches the `medication` def.",
+        "medical.true_allergies / documented_allergies": "True allergies vs the subset in the SQL `allergy` table (join on AllergyNum); ~25% under-documented (Kaboli 2004).",
+        "medical.contact": "Contact-channel preference emitted on the patient row (recruitment reachability).",
+        "medical.recent_medications": "Short-course/independent prescriptions (antibiotics, antibacterial rinses, gingival-hyperplasia drugs) with days_ago; back OraFlow EX13/IC6/EX12.",
+        "medical.true_conditions[].controlled": "For diabetes/hypertension/cancer: true=controlled, false=uncontrolled (uncontrolled written to disease.PatNote and trips OraFlow EX10).",
+        "study_eligibility": "OraFlow-US-003 answer key. eligible = every evaluable inclusion met AND no evaluable exclusion triggered, judged on ground truth. qualifying_site_count = baseline sites with BOP AND PD>=4mm (the enrollment gate IC3 and primary-endpoint basis). failed_inclusion / triggered_exclusion list the criterion keys; not_evaluable = consent/behavioral/unmodeled criteria.",
+        "_join": "exams[].PerioExamNum + tooth number -> SQL periomeasure rows (SequenceType 4 = probing, 2 = gingival margin, 6 = bleeding). DiseaseNum/MedicationPatNum/AllergyNum -> the medical tables.",
     }
 
     def write_perio_labels(self, path: str):
         """Serialize the ground-truth labels to a single JSON object (the SQL's answer key)."""
         doc = {
             "meta": {
-                "schema_version": 1,
+                "schema_version": 3,
                 "generator_version": GENERATOR_VERSION,
                 "seed": self.seed,
                 "patient_count": self.patient_count,
@@ -2461,6 +2866,7 @@ class SyntheticDataGenerator:
                     "stage_lock": self.perio_stage,
                     "grade_lock": self.perio_grade,
                     "no_perio": not self.gen_perio,
+                    "no_medical": not self.gen_medical,
                 },
                 "citations": self._LABEL_CITATIONS,
                 "label_definitions": self._LABEL_DEFINITIONS,
@@ -2661,7 +3067,13 @@ class SyntheticDataGenerator:
             note="Hirschfeld & Wasserman is a ~22yr reference; over a <=3yr window the gate is: "
                  "majority stable, a real downhill/extreme tail, extreme rarer than downhill")
         stable_f, down_f, ext_f = obs_tr
-        traj_ok = (0.75 <= stable_f <= 0.98) and (ext_f <= down_f + 0.03) and (down_f + ext_f >= 0.02)
+        # "extreme rarer than downhill" uses a SAMPLING-AWARE margin: at small treated N both
+        # tail classes are rare, so a round where downhill draws 0 while extreme draws a few
+        # is Monte-Carlo noise, not real drift. stol widens the margin at small N (~0.065 at
+        # n=150) while staying tight enough at large N to catch a genuinely inverted tail.
+        tail_margin = stol(0.04, len(treated))
+        traj_ok = (0.75 <= stable_f <= 0.98) and (ext_f <= down_f + tail_margin) \
+            and (down_f + ext_f >= 0.02)
         metrics[-1]["deviation"] = 0 if traj_ok else 1
         if default_mode:
             metrics[-1]["pass"] = traj_ok
@@ -2686,6 +3098,14 @@ class SyntheticDataGenerator:
             0 if ordered else 1, 0, 0, gated=default_mode and enough,
             note="natural-history reference 0.08/0.24/0.80 mm/yr; realized rates lower over a <=3yr window")
 
+        # 9) Medical history: documentation gaps must match the configured sensitivities,
+        #    and the diabetes/tobacco problem rows must trace back to the perio latents.
+        #    Expected documented prevalence = mean per-patient P(true) x doc_sens, computed
+        #    the exact-model way so age structure doesn't add spurious noise. Gate only the
+        #    well-powered conditions (>= ~25 expected documented events); the rest inform.
+        if self.gen_medical:
+            self._add_medical_metrics(add, stol, adults)
+
         gated = [m for m in metrics if m["gated"]]
         all_pass = all(m["pass"] for m in gated)
         return {
@@ -2693,13 +3113,124 @@ class SyntheticDataGenerator:
                 "generator_version": GENERATOR_VERSION, "seed": self.seed,
                 "patient_count": self.patient_count, "adults_profiled": n,
                 "metro": f"{self.metro['city']}, {self.metro['state']}",
-                "flags": {"stage_lock": self.perio_stage, "grade_lock": self.perio_grade},
+                "flags": {"stage_lock": self.perio_stage, "grade_lock": self.perio_grade,
+                          "no_medical": not self.gen_medical},
             },
             "metrics": metrics,
             "gated_count": len(gated),
             "gated_passed": sum(1 for m in gated if m["pass"]),
             "all_pass": all_pass,
         }
+
+    # Conditions with enough expected documented events (~>=25 at the default cohort
+    # size) to gate on; everything else in the catalog is reported informationally.
+    _MED_GATED_CONDITIONS = ("htn", "hld", "tobacco", "gerd", "t2dm", "oa",
+                             "depression", "anxiety", "asthma")
+
+    def _add_medical_metrics(self, add, stol, adults):
+        """Append medical-history fidelity metrics. Reads the true-vs-documented medical
+        records captured in _generate_medical_history. Pure (no RNG). n is read from the
+        actual adult count -- never hardcoded."""
+        meds = [p for p in adults if p.get("medical")]
+        n = len(meds)
+        if not n:
+            return
+        cond_by_key = {c["key"]: c for c in DISEASE_CATALOG}
+
+        # Per-condition TRUE prevalence vs the exact model expectation (mean per-patient
+        # probability). Only the gated conditions -- none of which read `truth` in their
+        # prob lambda -- can be evaluated with an empty truth dict, so this is exact.
+        for key in self._MED_GATED_CONDITIONS:
+            cond = cond_by_key[key]
+            exp = sum(cond["prob"](p["Age"], p["Gender"] == 1, p["perio"], {}) for p in meds) / n
+            obs = sum(1 for p in meds if any(t["key"] == key for t in p["medical"]["true_conditions"])) / n
+            add(f"med_true_prev_{key}", f"{cond['name']} true prevalence vs model",
+                round(obs, 4), round(exp, 4), stol(max(exp, 0.02), n))
+
+        # Pooled problem-list documentation sensitivity: documented rows / true conditions,
+        # vs the true-condition-weighted mean doc_sens. Thousands of instances -> tight,
+        # stable gate that catches a broken documentation sampler even when individual
+        # conditions are underpowered.
+        true_inst = doc_inst = exp_doc = 0.0
+        for p in meds:
+            for t in p["medical"]["true_conditions"]:
+                true_inst += 1
+                exp_doc += cond_by_key[t["key"]]["doc_sens"]
+            doc_inst += len(p["medical"]["documented_conditions"])
+        if true_inst:
+            add("problem_list_sensitivity",
+                f"documented problems / true conditions ({int(doc_inst)}/{int(true_inst)})",
+                round(doc_inst / true_inst, 4), round(exp_doc / true_inst, 4),
+                stol(exp_doc / true_inst, int(true_inst)))
+
+        # Medication-list coverage: documented med rows / true prescriptions vs MED_DOC_SENSITIVITY.
+        true_m = sum(len(p["medical"]["true_medications"]) for p in meds)
+        doc_m = sum(len(p["medical"]["documented_medications"]) for p in meds)
+        if true_m:
+            add("med_coverage", f"documented meds / true meds ({doc_m}/{true_m})",
+                round(doc_m / true_m, 4), MED_DOC_SENSITIVITY, stol(MED_DOC_SENSITIVITY, true_m))
+
+        # Coherence (boolean gates, expect zero violations):
+        # every perio.diabetic latent must surface as a true diabetes condition...
+        dm_bad = sum(1 for p in meds if p["perio"]["diabetic"]
+                     and not any(t["key"] in ("t2dm", "t1dm") for t in p["medical"]["true_conditions"]))
+        add("dm_latent_tiein", "every diabetic latent has a true diabetes condition",
+            dm_bad, 0, 0)
+        # ...tobacco truth must equal the smoker latent exactly...
+        tob_bad = sum(1 for p in meds if p["perio"]["smoker"]
+                      != any(t["key"] == "tobacco" for t in p["medical"]["true_conditions"]))
+        add("tobacco_latent_tiein", "true tobacco use matches the smoker latent", tob_bad, 0, 0)
+        # ...and every documented med must trace to a truly-present indicating condition.
+        true_keys = [{t["key"] for t in p["medical"]["true_conditions"]} for p in meds]
+        med_bad = 0
+        for p, tk in zip(meds, true_keys):
+            tm = {m["key"]: m["rx_for"] for m in p["medical"]["true_medications"]}
+            for dm in p["medical"]["documented_medications"]:
+                if tm.get(dm["key"]) not in tk:
+                    med_bad += 1
+        add("med_implies_condition", "documented meds trace to a true condition", med_bad, 0, 0)
+
+        # Penicillin allergy true prevalence (well-powered) vs the catalog target.
+        pen_prev = next(a["prev"] for a in ALLERGY_CATALOG if a["key"] == "penicillin")
+        pen_obs = sum(1 for p in meds if "penicillin" in p["medical"]["true_allergies"]) / n
+        add("allergy_penicillin_true_prev", "penicillin allergy true prevalence vs target",
+            round(pen_obs, 4), pen_prev, stol(pen_prev, n))
+
+        # Low-N conditions: reported, not gated (documented prevalence only).
+        for key in ("osteoporosis", "afib", "cad", "ckd3", "copd", "ra", "prosthetic_joint",
+                    "osa", "pregnancy", "former_smoker", "hypothyroid", "t1dm",
+                    "cancer", "pacemaker", "heart_valve", "tmd"):
+            cond = cond_by_key[key]
+            obs = sum(1 for p in meds if any(t["key"] == key for t in p["medical"]["true_conditions"])) / n
+            doc = sum(1 for p in meds if any(d["key"] == key for d in p["medical"]["documented_conditions"])) / n
+            add(f"med_true_prev_{key}", f"{cond['name']} true/doc prevalence (informational)",
+                round(obs, 4), round(doc, 4), 0.0, gated=False,
+                note=f"documented={round(doc, 4)}")
+
+        # OraFlow-US-003 study-eligibility cohort. A compound of ~18 evaluable criteria, so
+        # no tight analytic target -- gate only that the eligible pool is non-empty and
+        # non-trivial (catches an evaluator that qualifies everyone or no one). Per-criterion
+        # trigger rates and the qualifying-site mean are reported informationally.
+        elig = [r["study_eligibility"] for r in self.perio_labels if "study_eligibility" in r]
+        if elig:
+            n_elig = sum(1 for e in elig if e["eligible"])
+            prev = n_elig / len(elig)
+            # Narrow eligibility (Stage I-III A/B + >=8 BOP+PD>=4 sites + declined SRP + no
+            # medical exclusions) is realistically a small slice -- enrollment is hard. Gate
+            # only that the pool is non-trivially non-empty (catches an evaluator that
+            # qualifies no one or everyone), not a tight prevalence. Under a --stage/--grade
+            # lock the cohort is deliberately unrepresentative (e.g. Stage IV / Grade C can
+            # never meet IC2 -> 0 eligible is CORRECT), so the gate ungates, mirroring the
+            # trajectory/progression metrics.
+            in_band = 0.01 <= prev <= 0.30
+            elig_gated = not self.perio_stage and not self.perio_grade
+            add("eligible_cohort_prevalence",
+                f"OraFlow-US-003 truly-eligible adults {n_elig}/{len(elig)} = {prev:.3f} (band 1-30%)",
+                1 if in_band else 0, 1, 0, gated=elig_gated,
+                note="compound of ~18 criteria; sanity band only; informational under a lock")
+            qmean = sum(e["qualifying_site_count"] for e in elig) / len(elig)
+            add("qualifying_site_mean", "mean baseline BOP+PD>=4mm sites per adult",
+                round(qmean, 2), 0, 0, gated=False, note="IC3 threshold is >=8")
 
     def _print_fidelity_report(self, report: dict):
         """Render the fidelity report as an aligned observed-vs-expected/PASS table."""
@@ -2954,6 +3485,242 @@ class SyntheticDataGenerator:
         print(f"    Created {len(self.payments)} payments")
         print(f"    Created {len(self.paysplits)} paysplits")
 
+    # =========================================================================
+    # MEDICAL HISTORY (problem list / medications / allergies)
+    # =========================================================================
+
+    def _medical_onset(self, age: int, min_days: int = 90, max_years: int = 20) -> date:
+        """Draw a plausible diagnosis date: between min_days and up to max_years ago,
+        capped so onset never predates adulthood."""
+        horizon = min(max_years, max(1, age - 18)) * 365
+        return self.today - timedelta(days=random.randint(min_days, max(horizon, min_days + 1)))
+
+    def _generate_medical_history(self):
+        """Emit structured medical history for adults: diseasedef/disease (the problem
+        list), medication/medicationpat, allergydef/allergy. TRUTH FIRST: every
+        condition, prescription, and allergy the patient really has is drawn and kept on
+        patient["medical"]; the emitted rows then document each true item only with its
+        doc-sensitivity (problem lists < med lists < 1.0 -- see MEDICAL HISTORY
+        CONFIGURATION), so labels.json can score a screening query's recall/precision.
+        Diabetes and tobacco truth comes from the perio latents (never re-drawn). Runs
+        at the tail of generate_all -- see the call site for the RNG-order rule."""
+        print("  Generating medical history (problems, medications, allergies)...")
+
+        # Reference/definition rows: the whole catalog, unconditionally, so the def
+        # tables are identical regardless of cohort (stable joins across seeds).
+        dis_defs, med_defs, alg_defs = {}, {}, {}
+        for i, cond in enumerate(DISEASE_CATALOG):
+            num = self.next_diseasedef_num
+            self.next_diseasedef_num += 1
+            dis_defs[cond["key"]] = num
+            self.diseasedefs.append({"DiseaseDefNum": num, "DiseaseName": cond["name"]})
+            self.sql_statements.append(generate_insert(
+                "diseasedef",
+                ["DiseaseDefNum", "DiseaseName", "ItemOrder", "IsHidden", "DateTStamp",
+                 "ICD9Code", "SnomedCode", "Icd10Code"],
+                [num, cond["name"], i, 0, self.today, "", cond["snomed"], cond["icd10"]]))
+        for med in MEDICATION_CATALOG:
+            num = self.next_medication_num
+            self.next_medication_num += 1
+            med_defs[med["key"]] = num
+            self.medications.append({"MedicationNum": num, "MedName": med["name"], "RxCui": med["rxcui"]})
+            self.sql_statements.append(generate_insert(
+                "medication",
+                ["MedicationNum", "MedName", "GenericNum", "Notes", "DateTStamp", "RxCui", "IsHidden"],
+                [num, med["name"], num, med["notes"], self.today, med["rxcui"], 0]))
+        for al in ALLERGY_CATALOG:
+            num = self.next_allergydef_num
+            self.next_allergydef_num += 1
+            alg_defs[al["key"]] = num
+            self.allergydefs.append({"AllergyDefNum": num, "Description": al["name"]})
+            self.sql_statements.append(generate_insert(
+                "allergydef",
+                ["AllergyDefNum", "Description", "IsHidden", "DateTStamp", "SnomedType",
+                 "MedicationNum", "UniiCode"],
+                [num, al["name"], 0, self.today, 0, 0, ""]))
+
+        med_by_key = {m["key"]: m for m in MEDICATION_CATALOG}
+
+        for patient in self.patients:
+            profile = patient.get("perio")
+            if not profile:
+                continue                        # adults only (minors have no profile)
+            age, female = patient["Age"], patient["Gender"] == 1
+
+            # Truth: conditions, in strict catalog order (one draw per entry; entries
+            # reading `truth` -- t1dm, copd -- rely on this order).
+            truth = {}                          # key -> {"cond", "onset", "controlled"}
+            for cond in DISEASE_CATALOG:
+                p = cond["prob"](age, female, profile, truth)
+                if p > 0 and random.random() < p:
+                    if cond["key"] == "pregnancy":
+                        onset = self.today - timedelta(days=random.randint(10, 240))
+                    else:
+                        onset = self._medical_onset(age)
+                    # Controlled/uncontrolled status, drawn only for the conditions that
+                    # carry one (UNCONTROLLED_PROB); only the uncontrolled form trips
+                    # OraFlow EX10. The draw is conditional but deterministic (fixed catalog
+                    # order + fixed membership), so it preserves reproducibility.
+                    controlled = None
+                    if cond["key"] in UNCONTROLLED_PROB:
+                        controlled = random.random() >= UNCONTROLLED_PROB[cond["key"]]
+                    truth[cond["key"]] = {"cond": cond, "onset": onset, "controlled": controlled}
+
+            # Truth: prescriptions. rx_for = the condition that indicated the drug;
+            # setdefault dedupes multi-indication picks (e.g. metoprolol via afib+cad).
+            true_meds = {}                      # med key -> rx_for condition key
+            for key, t in truth.items():
+                for spec, rx_prob in t["cond"]["meds"]:
+                    if random.random() >= rx_prob:
+                        continue
+                    med_key = random.choice(spec) if isinstance(spec, list) else spec
+                    true_meds.setdefault(med_key, key)
+
+            # Documentation: problem list (each true condition with prob doc_sens).
+            documented = []
+            for key, t in truth.items():
+                if random.random() >= t["cond"]["doc_sens"]:
+                    continue
+                d_num = self.next_disease_num
+                self.next_disease_num += 1
+                # Uncontrolled status recorded as a free-text problem note (how a dental
+                # EHR typically flags it) -- a mineable but unstructured signal for EX10.
+                note = "Uncontrolled" if t["controlled"] is False else ""
+                self.diseases.append({"DiseaseNum": d_num, "PatNum": patient["PatNum"],
+                                      "DiseaseDefNum": dis_defs[key], "key": key})
+                self.sql_statements.append(generate_insert(
+                    "disease",
+                    ["DiseaseNum", "PatNum", "DiseaseDefNum", "PatNote", "DateTStamp",
+                     "ProbStatus", "DateStart", "DateStop", "SnomedProblemType", "FunctionStatus"],
+                    [d_num, patient["PatNum"], dis_defs[key], note, self.today,
+                     0, t["onset"], "0001-01-01", "", 0]))
+                documented.append({"key": key, "DiseaseNum": d_num, "icd10": t["cond"]["icd10"]})
+
+            # Documentation: medication list (better maintained than the problem list).
+            doc_meds = []
+            for med_key, rx_for in true_meds.items():
+                if random.random() >= MED_DOC_SENSITIVITY:
+                    continue
+                med = med_by_key[med_key]
+                mp_num = self.next_medicationpat_num
+                self.next_medicationpat_num += 1
+                start = max(truth[rx_for]["onset"],
+                            self.today - timedelta(days=random.randint(60, 5 * 365)))
+                self.medicationpats.append({"MedicationPatNum": mp_num, "PatNum": patient["PatNum"],
+                                            "MedicationNum": med_defs[med_key], "key": med_key})
+                self.sql_statements.append(generate_insert(
+                    "medicationpat",
+                    ["MedicationPatNum", "PatNum", "MedicationNum", "PatNote", "DateTStamp",
+                     "DateStart", "DateStop", "ProvNum", "MedDescript", "RxCui", "ErxGuid", "IsCpoe"],
+                    [mp_num, patient["PatNum"], med_defs[med_key], random.choice(med["sig"]),
+                     self.today, start, "0001-01-01", patient["PriProv"], "", med["rxcui"], "", 0]))
+                doc_meds.append({"key": med_key, "MedicationPatNum": mp_num, "RxCui": med["rxcui"]})
+
+            # Allergies: truth then documentation (allergy lists are incomplete too).
+            true_allergies, doc_allergies = [], []
+            for al in ALLERGY_CATALOG:
+                if random.random() >= al["prev"]:
+                    continue
+                true_allergies.append(al["key"])
+                if random.random() >= ALLERGY_DOC_SENSITIVITY:
+                    continue
+                a_num = self.next_allergy_num
+                self.next_allergy_num += 1
+                reactions = [r for r, _ in al["reactions"]]
+                weights = [w for _, w in al["reactions"]]
+                reaction = random.choices(reactions, weights=weights)[0]
+                self.allergies.append({"AllergyNum": a_num, "PatNum": patient["PatNum"],
+                                       "AllergyDefNum": alg_defs[al["key"]], "key": al["key"]})
+                self.sql_statements.append(generate_insert(
+                    "allergy",
+                    ["AllergyNum", "AllergyDefNum", "PatNum", "Reaction", "StatusIsActive",
+                     "DateTStamp", "DateAdverseReaction", "SnomedReaction"],
+                    [a_num, alg_defs[al["key"]], patient["PatNum"], reaction, 1,
+                     self.today, "0001-01-01", ""]))
+                doc_allergies.append({"key": al["key"], "AllergyNum": a_num})
+
+            # Independent short-course prescriptions (antibiotics, antibacterial rinses,
+            # gingival-hyperplasia drugs) -- not condition-indicated; each has its own
+            # DateStart straddling the protocol's 3-month look-back. These back OraFlow
+            # exclusions EX13/EX12 and inclusion IC6.
+            recent_meds = []
+            for spec in INDEPENDENT_RX:
+                prev = spec["prev"]
+                if spec["class"] == "antibacterial_rinse" and profile["stage"] != "healthy":
+                    prev += spec.get("perio_bonus", 0.0)   # perio patients rinse more
+                if random.random() >= prev:
+                    continue
+                med_key = random.choice(spec["meds"])
+                med = med_by_key[med_key]
+                lo, hi = spec["window"]
+                days_ago = random.randint(lo, hi)
+                start = self.today - timedelta(days=days_ago)
+                # Antibiotic courses end; rinses/hyperplasia drugs are ongoing.
+                stop = start + timedelta(days=random.randint(7, 14)) if spec["class"] == "antibiotic" else None
+                mp_num = self.next_medicationpat_num
+                self.next_medicationpat_num += 1
+                self.medicationpats.append({"MedicationPatNum": mp_num, "PatNum": patient["PatNum"],
+                                            "MedicationNum": med_defs[med_key], "key": med_key})
+                self.sql_statements.append(generate_insert(
+                    "medicationpat",
+                    ["MedicationPatNum", "PatNum", "MedicationNum", "PatNote", "DateTStamp",
+                     "DateStart", "DateStop", "ProvNum", "MedDescript", "RxCui", "ErxGuid", "IsCpoe"],
+                    [mp_num, patient["PatNum"], med_defs[med_key], random.choice(med["sig"]),
+                     self.today, start, stop if stop else "0001-01-01",
+                     patient["PriProv"], "", med["rxcui"], "", 0]))
+                recent_meds.append({"key": med_key, "class": spec["class"],
+                                    "MedicationPatNum": mp_num, "days_ago": days_ago})
+
+            # Label-ready truth-vs-documented record (attached to labels.json by
+            # _finalize_perio_labels; join keys DiseaseNum/MedicationPatNum/AllergyNum).
+            patient["medical"] = {
+                "true_conditions": [
+                    {"key": k, "icd10": t["cond"]["icd10"], "snomed": t["cond"]["snomed"],
+                     "onset": t["onset"].isoformat(),
+                     **({"controlled": t["controlled"]} if t["controlled"] is not None else {})}
+                    for k, t in truth.items()],
+                "documented_conditions": documented,
+                "true_medications": [
+                    {"key": mk, "rx_for": rf, "rxcui": med_by_key[mk]["rxcui"]}
+                    for mk, rf in true_meds.items()],
+                "documented_medications": doc_meds,
+                "recent_medications": recent_meds,
+                "true_allergies": true_allergies,
+                "documented_allergies": doc_allergies,
+            }
+
+    def _generate_study_signals(self):
+        """Emit the OraFlow-US-003 recruitment signal: 'SRP recommended but declined.'
+        The eligible population is periodontitis patients who did NOT proceed with
+        prescribed scaling & root planing (inclusion IC4). The PRIMARY target is the
+        UNTREATED Stage I-III patient who declined the initial SRP (0.80 get a standing
+        treatment-planned SRP); a SMALLER share of `treated` maintenance patients with
+        residual/recurrent disease decline a re-recommendation (0.20, per the protocol's
+        'can be on periodontal maintenance' wording) -- kept low so untreated decliners,
+        not previously-treated patients, dominate the eligible pool. The TP SRP is
+        ProcStatus=1 (never completed), so the 'recommended but not done' signal is
+        queryable in procedurelog. Runs at the tail (after payments/medical) so no
+        existing table's RNG order shifts."""
+        print("  Generating study-eligibility signals (declined-SRP recruitment pool)...")
+        declined = 0
+        for patient in self.patients:
+            profile = patient.get("perio")
+            if not profile or profile["stage"] not in ("I", "II", "III"):
+                continue
+            rate = 0.20 if profile["treated"] else 0.80
+            if random.random() >= rate:
+                continue
+            # Recommended in the past 3-14 months; 1-2 quadrants; mostly D4341 (>=4 teeth).
+            date_tp = self.today - timedelta(days=random.randint(90, 420))
+            code = random.choices(["D4341", "D4342"], weights=[0.7, 0.3])[0]
+            for quad in random.sample(QUADRANTS, k=random.randint(1, 2)):
+                self._create_procedure(patient=patient, apt_num=0, proc_code=code,
+                                       proc_date=date_tp, prov_num=patient["PriProv"],
+                                       status=1, quadrant=quad)
+            patient["declined_srp"] = True
+            declined += 1
+        print(f"    {declined} patients flagged as declined-SRP (treatment-planned, not completed)")
+
     def _print_stats(self):
         """Print summary statistics."""
         print("\n" + "="*60)
@@ -2995,6 +3762,22 @@ class SyntheticDataGenerator:
             if self._perio_capture:
                 print(f"  - Ground-truth capture: {len(self.perio_snapshots)} exam snapshots"
                       + (f", {len(self.perio_labels)} label records" if self.perio_labels else ""))
+        if self.gen_medical:
+            meds = [p["medical"] for p in self.patients if p.get("medical")]
+            n_true_cond = sum(len(m["true_conditions"]) for m in meds)
+            n_true_med = sum(len(m["true_medications"]) for m in meds)
+            n_true_alg = sum(len(m["true_allergies"]) for m in meds)
+            print(f"Medical Problems: {len(self.diseases)} documented / {n_true_cond} true")
+            print(f"Medications: {len(self.medicationpats)} documented / {n_true_med} true "
+                  f"({len(self.medications)} defs)")
+            print(f"Allergies: {len(self.allergies)} documented / {n_true_alg} true")
+            declined = sum(1 for p in self.patients if p.get("declined_srp"))
+            print(f"Declined-SRP recruitment pool (TP SRP, not completed): {declined}")
+            if self.perio_labels:
+                elig = [r["study_eligibility"] for r in self.perio_labels if "study_eligibility" in r]
+                n_elig = sum(1 for e in elig if e["eligible"])
+                print(f"OraFlow-US-003 truly-eligible: {n_elig}/{len(elig)}"
+                      + (f" ({100*n_elig/len(elig):.1f}%)" if elig else ""))
         print("-"*60)
         print(f"Total SQL statements: {len(self.sql_statements)}")
         print("="*60)
@@ -3028,6 +3811,8 @@ Built by the team at Luna (https://yourluna.co)
     parser.add_argument("--patients", type=int, default=DEFAULT_PATIENT_COUNT, help="Number of patients to generate (default: 750)")
     parser.add_argument("--output", type=str, default="synthetic_data.sql", help="Output SQL file (default: synthetic_data.sql)")
     parser.add_argument("--no-perio", action="store_true", help="Skip periodontal charting and treatment generation")
+    parser.add_argument("--no-medical", action="store_true",
+                        help="Skip structured medical history (problem list, medications, allergies)")
     parser.add_argument("--stage", type=str, choices=["I", "II", "III", "IV", "1", "2", "3", "4"],
                         help="TEST corner case: force every periodontitis patient to this single 2017 stage "
                              "(held strictly in-band, no progression to the next stage). Healthy patients are kept.")
@@ -3060,6 +3845,8 @@ Built by the team at Luna (https://yourluna.co)
         print("Warning: --labels/--fidelity-report require perio generation; ignoring with --no-perio.")
         args.labels = None
         args.fidelity_report = None
+    if args.no_perio and not args.no_medical:
+        print("Warning: medical history reads the perio risk latents; skipping it with --no-perio.")
 
     generator = SyntheticDataGenerator(
         seed=args.seed,
@@ -3071,6 +3858,7 @@ Built by the team at Luna (https://yourluna.co)
         perio_grade=perio_grade,
         gen_labels=args.labels is not None,
         gen_fidelity=args.fidelity_report is not None,
+        gen_medical=not args.no_medical,
     )
 
     sql_statements = generator.generate_all()

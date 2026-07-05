@@ -78,7 +78,9 @@ def longitudinal_worse_frac(rows):
     """Fraction of treated patients ending worse-than-baseline (mean PD)."""
     proccodes = {pc["CodeNum"]: pc["ProcCode"] for pc in rows["procedurecode"]}
     srp = {cn for cn,c in proccodes.items() if c in ("D4341","D4342")}
-    srp_pats = {p["PatNum"] for p in rows["procedurelog"] if p["CodeNum"] in srp}
+    # Only COMPLETED SRP (ProcStatus=2) is treatment; ProcStatus=1 is the treatment-planned
+    # "declined SRP" recruitment signal, whose (untreated) patients must not count as treated.
+    srp_pats = {p["PatNum"] for p in rows["procedurelog"] if p["CodeNum"] in srp and p["ProcStatus"] == 2}
     exam_pat = {e["PerioExamNum"]: e["PatNum"] for e in rows["perioexam"]}
     exam_date = {e["PerioExamNum"]: e["ExamDate"] for e in rows["perioexam"]}
     pd_by_exam = defaultdict(list)

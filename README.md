@@ -36,6 +36,9 @@ The generated database includes interconnected records across all major Open Den
 | `procnote` | Clinical notes |
 | `perioexam` | Periodontal charting sessions |
 | `periomeasure` | Per-tooth, per-site perio measurements (probing, recession, bleeding, etc.) |
+| `diseasedef` / `disease` | Problem-list definitions (real ICD-10 + SNOMED) and per-patient problems |
+| `medication` / `medicationpat` | Medication catalog (real RxNorm RxCui) and per-patient prescriptions |
+| `allergydef` / `allergy` | Allergen definitions and per-patient allergies |
 | `definition` | Reference data for dropdowns |
 
 ### Data Characteristics
@@ -48,6 +51,8 @@ The generated database includes interconnected records across all major Open Den
 - **3 years of visit history** with seasonal patterns
 - **Family accounts** with guarantor relationships
 - **Longitudinal periodontal charting** for adults, staged/graded per the 2017 classification (see below)
+- **Structured medical history** for adults — problem list, medications, and allergies at roughly NHANES-plausible, age/sex-conditioned prevalences, with **realistic documentation gaps** (see [Medical history](#medical-history-problems-medications-allergies))
+- **Contact-channel preferences** (`PreferContactMethod`/`PreferConfirmMethod`/`PreferRecallMethod`) for recruitment reachability
 
 ## Quick Start
 
@@ -96,6 +101,7 @@ mysql -u root -p opendental < synthetic_data.sql
 | `--seed` | 42 | Random seed for reproducibility |
 | `--output` | synthetic_data.sql | Output file path |
 | `--no-perio` | (off) | Skip periodontal charting and treatment generation |
+| `--no-medical` | (off) | Skip [structured medical history](#medical-history-problems-medications-allergies) (problem list, medications, allergies) |
 | `--stage` | (off) | **Test corner case** — force all periodontitis to one stage (`I`–`IV`); see below |
 | `--grade` | (off) | **Test corner case** — force all periodontitis to one grade (`A`–`C`); see below |
 | `--labels PATH` | (off) | Write the [ground-truth labels sidecar](#ground-truth-labels---labels) (JSON) alongside the SQL |
@@ -136,7 +142,7 @@ If you specify a city/state not in this list, the generator will create plausibl
 | 750 | ~67 MB | ~300,000 | ~3.9 MB |
 | 2,000 | ~174 MB | ~774,000 | ~10 MB |
 
-> Sizes grew substantially once full periodontal charting was added (each adult accrues many `periomeasure` rows across years of exams). Use `--no-perio` for a much smaller dump if you don't need perio data. The optional `--labels` sidecar (per-site true CAL for every exam) is off by default; its size scales with the perio data (roughly 6% of the SQL).
+> Sizes grew substantially once full periodontal charting was added (each adult accrues many `periomeasure` rows across years of exams). Use `--no-perio` for a much smaller dump if you don't need perio data. The optional `--labels` sidecar (per-site true CAL for every exam, plus the medical answer key) is off by default; its size scales with the perio data (roughly 6% of the SQL). The medical-history layer adds a few thousand small rows (problems/medications/allergies) — a rounding error next to the perio measurements; use `--no-medical` to omit it.
 
 ## Use Cases
 
@@ -193,6 +199,68 @@ By default the data reflects the **realistic distribution and progression** of d
 - **`--grade <A|B|C>`** — every periodontitis patient is fixed at that single grade (e.g. `--grade A` keeps everyone Grade A). Stages still vary; progression follows that grade's rate.
 - The two combine (`--stage III --grade C`). Healthy patients are still generated in both modes (only diseased patients are locked). These flags only affect periodontal data and are ignored under `--no-perio`.
 
+### Medical history (problems, medications, allergies)
+
+Real study-eligibility screening is mostly *medical* — diabetes, tobacco status, bisphosphonates (MRONJ risk), anticoagulants, immunosuppression, pregnancy, penicillin allergy — so the generator emits a structured problem list (`disease` with real ICD-10 + SNOMED codes), medications (`medicationpat` with real RxNorm RxCui), and allergies (`allergy`) for every adult. Diabetes and tobacco reuse the periodontal risk latents, so the coupling between systemic disease and periodontitis is real (e.g. diabetic smokers cluster in the worse perio stages).
+
+The catalog is ~21 conditions and ~25 medications at roughly NHANES-plausible, age/sex-conditioned prevalences, with conditional bumps (diabetes raises hypertension; COPD only in ever-smokers; osteoporosis skews to older women; pregnancy only in women 18–45).
+
+**Documentation gaps are modeled on purpose.** Real EHR problem lists are incomplete (Wright et al. 2015 measured 60–99% completeness across sites) while med and allergy lists are better but still imperfect (Kaboli et al. 2004). So each true condition is written to the problem list only with its per-condition sensitivity, each true prescription with ~95% probability, each true allergy with ~75%. The **ground truth is preserved in `--labels`** (`true_conditions` vs `documented_conditions`, etc.), which makes this a **labeled recruitment benchmark**: a patient-mining query only sees the documented rows, so you can score its recall and precision against the answer key.
+
+This is why it's useful for **mining prospective patients for a research study** — you can prototype and *validate* an eligibility screener against data where the correct answer is known. Example: find candidate subjects who are documented diabetic smokers with Stage III–IV periodontitis and no penicillin allergy:
+
+```sql
+SELECT p.PatNum
+FROM patient p
+JOIN disease d_dm  ON d_dm.PatNum = p.PatNum
+JOIN diseasedef dd_dm ON dd_dm.DiseaseDefNum = d_dm.DiseaseDefNum AND dd_dm.Icd10Code LIKE 'E11%'
+JOIN disease d_tob ON d_tob.PatNum = p.PatNum
+JOIN diseasedef dd_tob ON dd_tob.DiseaseDefNum = d_tob.DiseaseDefNum AND dd_tob.Icd10Code = 'F17.210'
+WHERE d_dm.ProbStatus = 0
+  AND NOT EXISTS (                       -- exclude documented penicillin allergy
+      SELECT 1 FROM allergy a
+      JOIN allergydef ad ON ad.AllergyDefNum = a.AllergyDefNum
+      WHERE a.PatNum = p.PatNum AND ad.Description = 'Penicillin' AND a.StatusIsActive = 1);
+```
+
+(Perio stage is not stored in Open Dental — join the `--labels` `profile.true_stage`, or infer it from CAL, to add the Stage III–IV filter.) Because the label file carries the true diabetics and smokers, you can measure exactly how many eligible patients this query *missed* because their diabetes was never charted. `--no-medical` turns the whole layer off; it is skipped automatically under `--no-perio` (it reads the perio latents).
+
+### OraFlow-US-003 eligibility benchmark
+
+The medical + perio layers are tuned so the dataset can be **scored against a real study protocol** — the Biolectrics OraFlow-US-003 Confirmatory Study (adults with Periodontitis Stage I–III Grade A/B, ≥8 sites with BOP + PD ≥4 mm, who decline SRP). When `--labels` is set, every adult record carries a **`study_eligibility`** answer key evaluating all 9 inclusion + 19 exclusion criteria against ground truth:
+
+```jsonc
+"study_eligibility": {
+  "protocol": "OraFlow-US-003 v13",
+  "eligible": false,
+  "qualifying_site_count": 11,          // CURRENT-exam sites with BOP AND PD>=4mm (gate IC3)
+  "natural_teeth": 27,
+  "true_stage": "II", "true_grade": "B",
+  "failed_inclusion": [],
+  "triggered_exclusion": ["EX9_tobacco"],   // criterion keys that disqualify
+  "on_antibacterial_rinse": false,
+  "not_evaluable": ["IC6_rinse_consent","EX4_amalgam_margin", ...]   // consent/unmodeled
+}
+```
+
+To make the protocol's criteria queryable, v0.5.0 added the signals a recruitment screen depends on: a **declined-SRP recruitment pool** (a treatment-planned but never-completed D4341/D4342 for periodontitis patients who forgo SRP), **systemic antibiotics** and **antibacterial rinses** with dates (the 3-month look-back for EX13 / the rinse switch for IC6), **anticoagulants incl. clopidogrel**, **cancer / pacemaker / prosthetic heart valve / TMD** conditions, and a controlled-vs-uncontrolled status on diabetes/HTN/cancer (written to the problem note; only *uncontrolled* disqualifies).
+
+Because a screening query only sees the *documented* SQL while the answer key holds the truth, you can score the query end-to-end. `tests/score_eligibility.py` runs a realistic naive query and reports it:
+
+```
+truly eligible (answer key): 23
+recall    = 1.000    (every eligible subject found)
+precision = 0.561    (~44% of candidates are actually ineligible)
+18 false positives — criteria the naive query could not see:
+  IC2_stage_grade   7     # stage/grade isn't stored in Open Dental
+  EX9_tobacco       4     # undocumented tobacco use
+  EX12_hyperplasia_med 4  # gingival-hyperplasia drug, not flagged
+  EX13_antibiotics  3     # recent antibiotic course
+  ...
+```
+
+That precision gap is the real recruitment risk — wasted screening visits on patients who turn out ineligible — and the answer key quantifies exactly which criteria a smarter query must recover. `tests/check_eligibility.py` proves the key describes the SQL: it recomputes `qualifying_site_count` directly from the `periomeasure` bleeding + probing rows and matches it to every label.
+
 ### Ground-truth labels (`--labels`)
 
 The generator is, under the hood, a **generative model with fully known latent state**: for every patient it chooses a true stage/grade/bone-loss and tracks a noise-free floating-point CAL at every site, then rounds, clamps, and encodes only the *observable* records into the SQL — discarding the truth. Real clinics never have that truth, so no dataset built from real EHRs can carry it. `--labels PATH` persists it as a JSON **answer key** that joins to the SQL, turning the dump from "realistic-looking data" into a **labeled benchmark** you can train *and objectively score* models against (2017 staging classifiers, attachment-loss progression predictors, treatment-response models, and measurement-error / examiner-variability models via true CAL vs emitted probing).
@@ -205,7 +273,7 @@ The file is a single JSON object:
 
 ```jsonc
 {
-  "meta": { "schema_version": 1, "seed": 42, "generated_date": "...",
+  "meta": { "schema_version": 3, "seed": 42, "generated_date": "...",
             "flags": {...}, "citations": [...], "label_definitions": {...} },
   "patients": [{
     "PatNum": 10412, "age": 57, "charted": true,
@@ -214,6 +282,15 @@ The file is a single JSON object:
                  "teeth_present_baseline": [...], "teeth_lost_to_perio": [...] },
     "trajectory": { "class": "downhill", "annual_mean_cal_mm": 0.31,
                     "treatment_response": "partial", "n_exams": 6, ... },
+    "medical": {
+      "true_conditions": [{ "key": "t2dm", "icd10": "E11.9", "snomed": "44054006", "onset": "2019-08-02" },
+                          { "key": "htn",  "icd10": "I10",   "snomed": "38341003", "onset": "..." }],
+      "documented_conditions": [{ "key": "t2dm", "DiseaseNum": 10188, "icd10": "E11.9" }],
+      "true_medications": [{ "key": "metformin", "rx_for": "t2dm", "rxcui": 6809 }],
+      "documented_medications": [{ "key": "metformin", "MedicationPatNum": 10233, "RxCui": 6809 }],
+      "true_allergies": ["penicillin"], "documented_allergies": [{ "key": "penicillin", "AllergyNum": 10041 }],
+      "contact": { "prefer_contact_method": 8, "txt_msg_ok": 1 }
+    },
     "exams": [{ "PerioExamNum": 10042, "ExamDate": "2024-03-11", "visit_type": "reeval",
                 "stage_at_visit": "III", "worst_true_cal_mm": 6.1, "risk_tier": "high",
                 "teeth": { "14": { "true_cal_mm": [5.8, 6.1, 5.9, 4.2, 4.0, 4.3],
@@ -223,9 +300,10 @@ The file is a single JSON object:
 }
 ```
 
-- **Join key:** each exam's `PerioExamNum` + tooth number map to the SQL `periomeasure` rows (`SequenceType 4` = probing). `observed_pd_mm` equals the emitted probing exactly; `true_cal_mm` is the noise-free CAL behind it (the emitted CAL = `round(true_cal)`).
+- **Join key:** each exam's `PerioExamNum` + tooth number map to the SQL `periomeasure` rows (`SequenceType 4` = probing). `observed_pd_mm` equals the emitted probing exactly; `true_cal_mm` is the noise-free CAL behind it (the emitted CAL = `round(true_cal)`). In the `medical` block, `DiseaseNum` / `MedicationPatNum` / `AllergyNum` join to the `disease` / `medicationpat` / `allergy` tables.
 - **Derived labels** (`trajectory.class`, `annual_mean_cal_mm`, `treatment_response`) are computed from the whole-mouth mean true CAL and deep-pocket closure — the clinical longitudinal measures — not from any single noisy site.
-- Adults who are profiled but not charted (e.g. a healthy patient not selected for screening) appear with `"charted": false` and a null trajectory; minors (no perio) are omitted. Off by default; ignored under `--no-perio`.
+- **Medical truth vs documentation:** `documented_*` is always a subset of `true_*`. The gap is deliberate (see [Medical history](#medical-history-problems-medications-allergies)), so you can score a patient-screening query's **recall and precision** — the documented rows are what a query finds, the `true_*` set is the answer key.
+- Adults who are profiled but not charted (e.g. a healthy patient not selected for screening) appear with `"charted": false` and a null trajectory; minors (no perio) are omitted. Off by default; ignored under `--no-perio`. `schema_version` is `3` (v0.5.0 added the `medical` block in v2 and the `study_eligibility` answer key in v3 — see [the OraFlow-US-003 eligibility benchmark](#oraflow-us-003-eligibility-benchmark)).
 
 ### Statistical-fidelity report (`--fidelity-report`)
 
@@ -235,7 +313,7 @@ Proves the generated cohort actually matches the epidemiology it claims to model
 python generate.py --patients 1000 --seed 42 --fidelity-report fidelity.json --output data.sql
 ```
 
-Each gated metric compares the cohort against the model's literature targets with a **sampling-noise-aware tolerance** (so it is robust across seeds yet still catches real drift): stage mix vs the exact model-expected distribution; periodontitis grade mix and a monotone Grade-C-by-stage rise; smoker/diabetes/compliance prevalence; radiographic-bone-loss bands and the III/IV apical-third split; per-stage SRP utilization and "healthy get no SRP"; individualized recall cadence; the treated-cohort stable/downhill/extreme trajectory split (Hirschfeld & Wasserman reference); and the untreated **A ≤ B ≤ C** progression ordering. Low-N per-stage cells are reported as *informational*. Under `--stage`/`--grade` locks the distribution and progression metrics automatically become informational (the cohort is deliberately non-representative).
+Each gated metric compares the cohort against the model's literature targets with a **sampling-noise-aware tolerance** (so it is robust across seeds yet still catches real drift): stage mix vs the exact model-expected distribution; periodontitis grade mix and a monotone Grade-C-by-stage rise; smoker/diabetes/compliance prevalence; radiographic-bone-loss bands and the III/IV apical-third split; per-stage SRP utilization and "healthy get no SRP"; individualized recall cadence; the treated-cohort stable/downhill/extreme trajectory split (Hirschfeld & Wasserman reference); and the untreated **A ≤ B ≤ C** progression ordering. When the medical-history layer is on, it also gates the well-powered condition prevalences (hypertension, hyperlipidemia, tobacco, GERD, diabetes, osteoarthritis, depression, anxiety, asthma), the pooled **problem-list documentation sensitivity** and medication coverage, the diabetes/tobacco latent tie-ins, and penicillin-allergy prevalence. Low-N per-stage cells and rare conditions are reported as *informational*. Under `--stage`/`--grade` locks the distribution and progression metrics automatically become informational (the cohort is deliberately non-representative).
 
 ### Schema Compatibility
 
@@ -243,7 +321,7 @@ Tested with Open Dental versions 22.x and 23.x. The generator outputs standard M
 
 ### Primary Key Strategy
 
-All generated primary keys start at 10,000+ to avoid collisions if you load the data into an existing database with some records.
+All generated primary keys start at 10,000+ to avoid collisions if you load the data into an existing database with some records. This includes the medical-history definition tables (`diseasedef`/`medication`/`allergydef`), which start at 10,000 rather than the low starting points a fresh Open Dental install uses — real practices routinely carry well over 100 such rows, so a low start would risk collisions.
 
 ## Built By
 

@@ -41,7 +41,7 @@ def main():
     pats = doc["patients"]
     print(f"\n=== Labels integrity: {os.path.basename(labpath)} vs {os.path.basename(sqlpath)} ===")
     check(not rows.get("_PARSE_ERROR"), "SQL parses cleanly")
-    check(doc.get("meta", {}).get("schema_version") == 1, "labels meta.schema_version == 1")
+    check(doc.get("meta", {}).get("schema_version") == 3, "labels meta.schema_version == 3")
 
     # SQL per-site lookups keyed on (PerioExamNum, IntTooth)
     probing, ging = {}, {}

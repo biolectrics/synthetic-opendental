@@ -99,6 +99,25 @@ def main():
     for code in ("D4260", "D4261", "D4381"):
         check(code in proccodes.values(), f"new code {code} present in procedurecode rows")
 
+    # --- medical history: structural FK + adults-only (present unless --no-medical) ---
+    diseasedefs = {d["DiseaseDefNum"] for d in rows.get("diseasedef", [])}
+    medicationdefs = {m["MedicationNum"]: m for m in rows.get("medication", [])}
+    allergydefs = {a["AllergyDefNum"] for a in rows.get("allergydef", [])}
+    diseases = rows.get("disease", [])
+    medpats = rows.get("medicationpat", [])
+    allergies = rows.get("allergy", [])
+    if diseases or medpats or allergies:
+        med_pats = ({d["PatNum"] for d in diseases} | {m["PatNum"] for m in medpats}
+                    | {a["PatNum"] for a in allergies})
+        check(all(pn in patients for pn in med_pats), "every medical PatNum resolves to a patient")
+        check(all(age(patients[pn]) >= 18 for pn in med_pats), "medical history is adults-only")
+        check(all(d["DiseaseDefNum"] in diseasedefs for d in diseases)
+              and all(m["MedicationNum"] in medicationdefs for m in medpats)
+              and all(a["AllergyDefNum"] in allergydefs for a in allergies),
+              "every disease/medicationpat/allergy FK resolves to its def table")
+        check(all(m["RxCui"] == medicationdefs[m["MedicationNum"]]["RxCui"] for m in medpats),
+              "medicationpat.RxCui matches its medication def")
+
     # --- SequenceType validity (never 5 SkipTooth or 7 CAL) ---
     seqs = defaultdict(int)
     for m in meas:
@@ -188,10 +207,13 @@ def main():
         return any(x["ProcCode"] == code for x in proc_by_pat[pn])
 
     # periodontitis patients (have SRP) should also have D0180 and (once enough time
-    # has passed since therapy) D4910 maintenance.
-    srp_pats = {p["PatNum"] for p in procs if p["ProcCode"] in ("D4341","D4342")}
+    # has passed since therapy) D4910 maintenance. Only COMPLETED SRP (ProcStatus=2)
+    # counts as treatment -- a treatment-PLANNED SRP (ProcStatus=1) is the "declined SRP"
+    # recruitment signal (see generate.py _generate_study_signals), not actual therapy.
+    srp_pats = {p["PatNum"] for p in procs if p["ProcCode"] in ("D4341","D4342") and p["ProcStatus"] == 2}
     def earliest_srp(pn):
-        ds = [p["ProcDate"] for p in proc_by_pat[pn] if p["ProcCode"] in ("D4341","D4342")]
+        ds = [p["ProcDate"] for p in proc_by_pat[pn]
+              if p["ProcCode"] in ("D4341","D4342") and p["ProcStatus"] == 2]
         return min(datetime.strptime(d, "%Y-%m-%d").date() for d in ds)
     miss_eval = [pn for pn in srp_pats if not has_code(pn,"D0180")]
     # only require maintenance for patients whose SRP was >200 days ago
