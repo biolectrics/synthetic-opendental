@@ -39,7 +39,7 @@ from faker import Faker
 
 DEFAULT_SEED = 42
 DEFAULT_PATIENT_COUNT = 750
-GENERATOR_VERSION = "0.5.0"
+GENERATOR_VERSION = "0.5.1"
 
 # Age distribution percentages (based on US dental patient demographics)
 AGE_DISTRIBUTION = [
@@ -3657,6 +3657,13 @@ class SyntheticDataGenerator:
                 start = self.today - timedelta(days=days_ago)
                 # Antibiotic courses end; rinses/hyperplasia drugs are ongoing.
                 stop = start + timedelta(days=random.randint(7, 14)) if spec["class"] == "antibiotic" else None
+                sig = random.choice(med["sig"])
+                # Allergy-aware prescribing: never dispense amoxicillin (a penicillin) to a
+                # penicillin/amoxicillin-allergic patient. Every draw above is consumed either
+                # way, so the RNG stream -- and every downstream table (incl. the declined-SRP
+                # pool and eligible cohort) -- is unchanged; only the incoherent row is withheld.
+                if med_key == "amoxicillin" and ({"penicillin", "amoxicillin"} & set(true_allergies)):
+                    continue
                 mp_num = self.next_medicationpat_num
                 self.next_medicationpat_num += 1
                 self.medicationpats.append({"MedicationPatNum": mp_num, "PatNum": patient["PatNum"],
@@ -3665,7 +3672,7 @@ class SyntheticDataGenerator:
                     "medicationpat",
                     ["MedicationPatNum", "PatNum", "MedicationNum", "PatNote", "DateTStamp",
                      "DateStart", "DateStop", "ProvNum", "MedDescript", "RxCui", "ErxGuid", "IsCpoe"],
-                    [mp_num, patient["PatNum"], med_defs[med_key], random.choice(med["sig"]),
+                    [mp_num, patient["PatNum"], med_defs[med_key], sig,
                      self.today, start, stop if stop else "0001-01-01",
                      patient["PriProv"], "", med["rxcui"], "", 0]))
                 recent_meds.append({"key": med_key, "class": spec["class"],

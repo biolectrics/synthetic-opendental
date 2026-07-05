@@ -183,6 +183,7 @@ def main():
     mtx_bad = 0
     antico_bad = 0
     excl_bad = 0
+    pcn_amox_bad = 0
     ANTICO = {"apixaban", "warfarin", "rivaroxaban"}
     for p in doc["patients"]:
         m = p.get("medical")
@@ -210,6 +211,11 @@ def main():
             mtx_bad += 1
         if (ANTICO & tm) and "afib" not in tk:
             antico_bad += 1
+        # Allergy-aware prescribing: a penicillin/amoxicillin-allergic patient must not
+        # have been dispensed amoxicillin (a penicillin).
+        recent_keys = {x["key"] for x in m.get("recent_medications", [])}
+        if "amoxicillin" in recent_keys and ({"penicillin", "amoxicillin"} & set(m.get("true_allergies", []))):
+            pcn_amox_bad += 1
     check(preg_bad == 0, f"pregnancy only in females 18-45 ({preg_bad} bad)")
     check(tob_bad == 0, f"tobacco truth matches the smoker latent ({tob_bad} bad)")
     check(dm_bad == 0, f"every diabetic latent has a true diabetes condition ({dm_bad} bad)")
@@ -218,6 +224,7 @@ def main():
     check(bis_bad == 0, f"bisphosphonate only with osteoporosis ({bis_bad} bad)")
     check(mtx_bad == 0, f"methotrexate only with rheumatoid arthritis ({mtx_bad} bad)")
     check(antico_bad == 0, f"anticoagulant only with atrial fibrillation ({antico_bad} bad)")
+    check(pcn_amox_bad == 0, f"no amoxicillin dispensed to a penicillin/amoxicillin-allergic patient ({pcn_amox_bad} bad)")
 
     # Uncontrolled free-text note only on controllable conditions (diabetes/HTN/cancer).
     CONTROLLABLE_ICD10 = {"E11.9", "E10.9", "I10", "C80.1"}
