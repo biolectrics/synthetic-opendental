@@ -3857,7 +3857,9 @@ class SyntheticDataGenerator:
                 print(f"OraFlow-US-003 truly-eligible: {n_elig}/{len(elig)}"
                       + (f" ({100*n_elig/len(elig):.1f}%)" if elig else ""))
         print("-"*60)
-        print(f"Total SQL statements: {len(self.sql_statements)}")
+        # When streaming, sql_statements is empty here (flushed per phase) -- report the running _emitted
+        # total instead of the drained buffer length. In-memory mode: both are equal.
+        print(f"Total SQL statements: {self._emitted or len(self.sql_statements)}")
         print("="*60)
 
 
