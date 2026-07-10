@@ -973,7 +973,9 @@ class SyntheticDataGenerator:
         self.paysplits = []
         self.claimprocs = []
         self.perioexams = []
-        self.periomeasures = []
+        # periomeasure rows are a LEAF (nothing references them) and there are ~290/adult -> ~12M at 40k.
+        # We never read their contents (only a count), so retain a counter instead of ~12M dicts (multi-GB).
+        self.periomeasure_count = 0
         self.diseasedefs = []
         self.diseases = []
         self.medications = []
@@ -1039,6 +1041,17 @@ class SyntheticDataGenerator:
             for k in range(0, len(tuples), BATCH_ROWS):
                 self._out.write(prefix + ",".join(tuples[k:k + BATCH_ROWS]) + ";\n")
         rows.clear()
+
+    # Flush threshold for in-phase streaming: at ~150 bytes/statement, 50k rows ~= 7.5 MB per flush --
+    # small enough to bound memory during the perio phase (~12M rows), large enough to keep INSERT batching
+    # efficient. Only phases that emit a very large number of rows in one call need to call this.
+    _FLUSH_THRESHOLD = 50_000
+
+    def _maybe_flush(self):
+        """Flush mid-phase if the streamed buffer has grown past the threshold. No-op when not streaming
+        (out is None) -- the in-memory/QA path still accumulates and returns everything, byte-for-byte."""
+        if self._out is not None and len(self.sql_statements) >= self._FLUSH_THRESHOLD:
+            self._flush()
 
     def generate_all(self, out=None) -> list[str]:
         """Generate all synthetic data. If ``out`` (a text file handle) is given, the SQL is STREAMED to it
@@ -2279,16 +2292,16 @@ class SyntheticDataGenerator:
         m_num = self.next_periomeasure_num
         self.next_periomeasure_num += 1
         mb, b, db, ml, l, dl = surfaces
-        self.periomeasures.append({
-            "PerioMeasureNum": m_num, "PerioExamNum": exam_num,
-            "SequenceType": seq_type, "IntTooth": tooth,
-        })
+        self.periomeasure_count += 1
         self.sql_statements.append(generate_insert(
             "periomeasure",
             ["PerioMeasureNum", "PerioExamNum", "SequenceType", "IntTooth", "ToothValue",
              "MBvalue", "Bvalue", "DBvalue", "MLvalue", "Lvalue", "DLvalue", "SecDateTEdit"],
             [m_num, exam_num, seq_type, tooth, tooth_value, mb, b, db, ml, l, dl, exam_dt]
         ))
+        # Bound the streamed SQL buffer: ~12M perio rows would otherwise pile up (~1.8GB) before the
+        # single post-phase flush. Flush in place once the buffer is large (no-op when not streaming).
+        self._maybe_flush()
 
     def _emit_perio_exam(self, patient: dict, exam_date: date, chart: dict, prov_num: int,
                          full: bool, inflammation: float, visit_type: str = "maintenance",
@@ -2609,7 +2622,7 @@ class SyntheticDataGenerator:
                 step = step + timedelta(days=gap)
                 i += 1
 
-        print(f"    Created {len(self.perioexams)} perio exams, {len(self.periomeasures)} measurements")
+        print(f"    Created {len(self.perioexams)} perio exams, {self.periomeasure_count} measurements")
 
     # OraFlow-US-003 protocol constants (v13, 2026-06-30).
     PROTOCOL_ID = "OraFlow-US-003 v13"
@@ -3820,7 +3833,7 @@ class SyntheticDataGenerator:
             stage_counts = Counter(pr["stage"] for pr in profiles)
             grade_counts = Counter(pr["grade"] for pr in profiles if pr["stage"] != "healthy")
             print(f"Perio Exams: {len(self.perioexams)}")
-            print(f"Perio Measurements: {len(self.periomeasures)}")
+            print(f"Perio Measurements: {self.periomeasure_count}")
             print(f"  - Periodontitis patients (Stage I-IV): {perio_pats}")
             print(f"  - Stage mix: " + ", ".join(f"{s}={stage_counts.get(s,0)}" for s in PERIO_STAGES))
             print(f"  - Grade mix (perio): " + ", ".join(f"{g}={grade_counts.get(g,0)}" for g in ("A","B","C")))
