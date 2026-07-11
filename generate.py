@@ -880,6 +880,12 @@ def generate_insert(table: str, columns: list[str], values: list[Any]) -> str:
     return f"INSERT INTO `{table}` ({cols}) VALUES ({vals});"
 
 
+# Rows per multi-row INSERT when batching is on (>1000 patients). 500 keeps each statement well under a
+# default max_allowed_packet while cutting the statement count ~500x — a big speedup for BOTH generation
+# (fewer, larger writes) and the MySQL load. Small enough that any server accepts it without tuning.
+BATCH_ROWS = 500
+
+
 # =============================================================================
 # DATA GENERATOR CLASS
 # =============================================================================
@@ -967,7 +973,9 @@ class SyntheticDataGenerator:
         self.paysplits = []
         self.claimprocs = []
         self.perioexams = []
-        self.periomeasures = []
+        # periomeasure rows are a LEAF (nothing references them) and there are ~290/adult -> ~12M at 40k.
+        # We never read their contents (only a count), so retain a counter instead of ~12M dicts (multi-GB).
+        self.periomeasure_count = 0
         self.diseasedefs = []
         self.diseases = []
         self.medications = []
@@ -1003,39 +1011,93 @@ class SyntheticDataGenerator:
         self.history_start = self.today - timedelta(days=3*365)  # 3 years ago
         self.future_end = self.today + timedelta(days=90)  # 3 months ahead
 
-    def generate_all(self) -> list[str]:
-        """Generate all synthetic data and return SQL statements."""
+    def _flush(self):
+        """Stream accumulated SQL to the output file and clear the buffer (bounds memory on huge runs).
+        No-op when not streaming (out is None) — then statements accumulate and are returned by
+        generate_all() for in-memory callers (the QA suite).
+
+        With batching OFF (<=1000 patients) each row is written as its own single-row INSERT — byte-identical
+        to the original output. With batching ON (>1000 patients) consecutive rows are coalesced into
+        multi-row `INSERT INTO t (cols) VALUES (r1),(r2),...;` statements (<= BATCH_ROWS rows each), grouped
+        by the table+columns prefix. Same rows, same escaped values — only the statement packing changes;
+        grouping is safe because the dump loads under SET FOREIGN_KEY_CHECKS=0 (intra-dump order is irrelevant)."""
+        if self._out is None or not self.sql_statements:
+            return
+        rows = self.sql_statements
+        self._emitted += len(rows)
+        if not self._batched:
+            self._out.write("\n".join(rows) + "\n")
+            rows.clear()
+            return
+        # Batched: group by the "INSERT INTO `t` (cols) VALUES " prefix (dict preserves first-seen order),
+        # then emit each group as multi-row INSERTs chunked to BATCH_ROWS. partition(" VALUES ") is safe:
+        # the first " VALUES " is always the SQL keyword (column names never contain it), so any value that
+        # happens to contain "VALUES" stays in the tuple part.
+        groups: dict[str, list[str]] = {}
+        for stmt in rows:
+            head, sep, tail = stmt.partition(" VALUES ")
+            groups.setdefault(head + sep, []).append(tail[:-1])  # tail[:-1] drops the trailing ';'
+        for prefix, tuples in groups.items():
+            for k in range(0, len(tuples), BATCH_ROWS):
+                self._out.write(prefix + ",".join(tuples[k:k + BATCH_ROWS]) + ";\n")
+        rows.clear()
+
+    # Flush threshold for in-phase streaming: at ~150 bytes/statement, 50k rows ~= 7.5 MB per flush --
+    # small enough to bound memory during the perio phase (~12M rows), large enough to keep INSERT batching
+    # efficient. Only phases that emit a very large number of rows in one call need to call this.
+    _FLUSH_THRESHOLD = 50_000
+
+    def _maybe_flush(self):
+        """Flush mid-phase if the streamed buffer has grown past the threshold. No-op when not streaming
+        (out is None) -- the in-memory/QA path still accumulates and returns everything, byte-for-byte."""
+        if self._out is not None and len(self.sql_statements) >= self._FLUSH_THRESHOLD:
+            self._flush()
+
+    def generate_all(self, out=None) -> list[str]:
+        """Generate all synthetic data. If ``out`` (a text file handle) is given, the SQL is STREAMED to it
+        per phase — memory stays bounded to one phase's statements instead of buffering all ~N million — and
+        the returned list is empty. Without ``out`` the old behavior holds: everything accumulates in memory
+        and is returned. (The record dicts — self.patients/appointments/... — always stay in RAM because
+        later tables reference earlier rows' keys; only the SQL-string bulk is streamed.)"""
+        self._out = out
+        self._emitted = 0
+        # Batch multi-row INSERTs only for larger runs (>1000 patients), where the statement-count reduction
+        # is worth the (harmless, FK-checks-off) per-table regrouping. At/below 1000 the output stays
+        # single-row and byte-identical to the pre-batch tool — so the QA fixtures are unaffected.
+        self._batched = out is not None and self.patient_count > 1000
         print(f"Generating synthetic data for {self.metro['city']}, {self.metro['state']}...")
-        print(f"Seed: {self.seed}, Patients: {self.patient_count}")
+        print(f"Seed: {self.seed}, Patients: {self.patient_count}  (batched INSERTs: {'on' if self._batched else 'off'})")
 
         # Generate base reference data first (procedurecode, definition)
         # This makes the output self-contained - no external data needed
-        self._generate_base_data()
+        self._generate_base_data(); self._flush()
 
         # Generate in FK order
-        self._generate_providers()
-        self._generate_operatories()
-        self._generate_carriers()
-        self._generate_insplans()
-        self._generate_patients()
+        self._generate_providers(); self._flush()
+        self._generate_operatories(); self._flush()
+        self._generate_carriers(); self._flush()
+        self._generate_insplans(); self._flush()
+        self._generate_patients(); self._flush()
         if self.gen_perio:
-            self._assign_perio_profiles()
-        self._generate_inssubs_and_patplans()
-        self._generate_appointments_and_procedures()
+            self._assign_perio_profiles(); self._flush()
+        self._generate_inssubs_and_patplans(); self._flush()
+        self._generate_appointments_and_procedures(); self._flush()
         if self.gen_perio:
-            self._generate_perio()
-        self._generate_recalls()
-        self._generate_commlogs()
-        self._generate_payments()
+            self._generate_perio(); self._flush()
+        self._generate_recalls(); self._flush()
+        self._generate_commlogs(); self._flush()
+        self._generate_payments(); self._flush()
         # Medical history runs at the TAIL on purpose: it draws its own RNG after every
         # other module's draws, so enabling/disabling it (or changing its catalog) never
         # shifts the bytes of any table above -- only the appended rows change.
         if self.gen_medical:
             self._generate_medical_history()
             self._generate_study_signals()   # declined-SRP recruitment pool (IC4)
+            self._flush()
         if self.gen_perio and self._perio_capture:
             self._finalize_perio_labels()   # pure post-processing (no RNG); runs after
                                             # medical history so labels can attach it
+        self._flush()
 
         # Print summary stats
         self._print_stats()
@@ -2230,16 +2292,16 @@ class SyntheticDataGenerator:
         m_num = self.next_periomeasure_num
         self.next_periomeasure_num += 1
         mb, b, db, ml, l, dl = surfaces
-        self.periomeasures.append({
-            "PerioMeasureNum": m_num, "PerioExamNum": exam_num,
-            "SequenceType": seq_type, "IntTooth": tooth,
-        })
+        self.periomeasure_count += 1
         self.sql_statements.append(generate_insert(
             "periomeasure",
             ["PerioMeasureNum", "PerioExamNum", "SequenceType", "IntTooth", "ToothValue",
              "MBvalue", "Bvalue", "DBvalue", "MLvalue", "Lvalue", "DLvalue", "SecDateTEdit"],
             [m_num, exam_num, seq_type, tooth, tooth_value, mb, b, db, ml, l, dl, exam_dt]
         ))
+        # Bound the streamed SQL buffer: ~12M perio rows would otherwise pile up (~1.8GB) before the
+        # single post-phase flush. Flush in place once the buffer is large (no-op when not streaming).
+        self._maybe_flush()
 
     def _emit_perio_exam(self, patient: dict, exam_date: date, chart: dict, prov_num: int,
                          full: bool, inflammation: float, visit_type: str = "maintenance",
@@ -2560,7 +2622,7 @@ class SyntheticDataGenerator:
                 step = step + timedelta(days=gap)
                 i += 1
 
-        print(f"    Created {len(self.perioexams)} perio exams, {len(self.periomeasures)} measurements")
+        print(f"    Created {len(self.perioexams)} perio exams, {self.periomeasure_count} measurements")
 
     # OraFlow-US-003 protocol constants (v13, 2026-06-30).
     PROTOCOL_ID = "OraFlow-US-003 v13"
@@ -3271,6 +3333,15 @@ class SyntheticDataGenerator:
         overdue_count = 0
         target_overdue = int(len(self.patients) * 0.26)
 
+        # PERF: pre-index appointments by PatNum ONCE (O(appointments)) so the per-patient hygiene lookups
+        # below are O(1) instead of a full self.appointments scan per patient. Without this the two scans
+        # made recall generation O(patients * appointments) — ~29 billion ops at 40k patients (hours);
+        # indexed it is O(n) (seconds). Iterating self.appointments in order preserves per-patient order,
+        # so max(...) and future_hygiene[0] pick the same rows as the original full-list scans.
+        appts_by_pat: dict = {}
+        for a in self.appointments:
+            appts_by_pat.setdefault(a["PatNum"], []).append(a)
+
         for patient in self.patients:
             if patient["Age"] < 3:
                 continue
@@ -3281,10 +3352,11 @@ class SyntheticDataGenerator:
             # Standard 6-month recall interval
             interval = "0y6m0d"
 
+            pat_appts = appts_by_pat.get(patient["PatNum"], [])
+
             # Find last hygiene appointment
-            patient_apts = [a for a in self.appointments
-                          if a["PatNum"] == patient["PatNum"]
-                          and a["AptStatus"] == 2
+            patient_apts = [a for a in pat_appts
+                          if a["AptStatus"] == 2
                           and a["IsHygiene"]]
 
             if patient_apts:
@@ -3302,9 +3374,8 @@ class SyntheticDataGenerator:
                 overdue_count += 1
 
             # Check if already scheduled
-            future_hygiene = [a for a in self.appointments
-                            if a["PatNum"] == patient["PatNum"]
-                            and a["AptStatus"] == 1
+            future_hygiene = [a for a in pat_appts
+                            if a["AptStatus"] == 1
                             and a["IsHygiene"]]
             date_scheduled = future_hygiene[0]["AptDateTime"].date() if future_hygiene else date(1, 1, 1)
 
@@ -3762,7 +3833,7 @@ class SyntheticDataGenerator:
             stage_counts = Counter(pr["stage"] for pr in profiles)
             grade_counts = Counter(pr["grade"] for pr in profiles if pr["stage"] != "healthy")
             print(f"Perio Exams: {len(self.perioexams)}")
-            print(f"Perio Measurements: {len(self.periomeasures)}")
+            print(f"Perio Measurements: {self.periomeasure_count}")
             print(f"  - Periodontitis patients (Stage I-IV): {perio_pats}")
             print(f"  - Stage mix: " + ", ".join(f"{s}={stage_counts.get(s,0)}" for s in PERIO_STAGES))
             print(f"  - Grade mix (perio): " + ", ".join(f"{g}={grade_counts.get(g,0)}" for g in ("A","B","C")))
@@ -3786,7 +3857,9 @@ class SyntheticDataGenerator:
                 print(f"OraFlow-US-003 truly-eligible: {n_elig}/{len(elig)}"
                       + (f" ({100*n_elig/len(elig):.1f}%)" if elig else ""))
         print("-"*60)
-        print(f"Total SQL statements: {len(self.sql_statements)}")
+        # When streaming, sql_statements is empty here (flushed per phase) -- report the running _emitted
+        # total instead of the drained buffer length. In-memory mode: both are equal.
+        print(f"Total SQL statements: {self._emitted or len(self.sql_statements)}")
         print("="*60)
 
 
@@ -3868,11 +3941,10 @@ Built by the team at Luna (https://yourluna.co)
         gen_medical=not args.no_medical,
     )
 
-    sql_statements = generator.generate_all()
-
-    # Write output
+    # STREAM the SQL to disk as it is generated: open the file, write the header, then let generate_all()
+    # write each phase's statements directly (bounded memory — no ~N-million-statement in-RAM buffer).
     output_path = args.output
-    print(f"\nWriting SQL to {output_path}...")
+    print(f"\nWriting SQL to {output_path} (streaming)...")
 
     with open(output_path, 'w') as f:
         f.write("-- =============================================================================\n")
@@ -3881,7 +3953,7 @@ Built by the team at Luna (https://yourluna.co)
         f.write(f"-- Generated: {datetime.now().isoformat()}\n")
         f.write(f"-- Seed: {args.seed}\n")
         f.write(f"-- Metro: {generator.metro['city']}, {generator.metro['state']}\n")
-        f.write(f"-- Patients: {len(generator.patients)}\n")
+        f.write(f"-- Patients: {args.patients}\n")   # generation streams below; patients not built yet
         f.write("-- \n")
         f.write("-- This is 100% synthetic data for testing and demo purposes.\n")
         f.write("-- All names, SSNs, addresses, and other details are computer-generated.\n")
@@ -3893,12 +3965,12 @@ Built by the team at Luna (https://yourluna.co)
 
         f.write("SET FOREIGN_KEY_CHECKS = 0;\n\n")
 
-        for statement in sql_statements:
-            f.write(statement + "\n")
+        # Generate + stream the body directly into the file, phase by phase.
+        generator.generate_all(out=f)
 
         f.write("\nSET FOREIGN_KEY_CHECKS = 1;\n")
 
-    print(f"Done! Generated {len(sql_statements)} SQL statements.")
+    print(f"Done! Generated {generator._emitted} SQL statements.")
 
     # Ground-truth labels sidecar (the SQL's answer key).
     if generator.gen_labels:

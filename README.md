@@ -91,6 +91,8 @@ mysql -u root -p opendental < synthetic_data.sql
 
 > **Note:** The generated SQL uses `SET FOREIGN_KEY_CHECKS = 0` at the start to allow loading in any order. Foreign key checks are re-enabled at the end.
 
+> **Large datasets:** The SQL is **streamed to disk phase-by-phase** as it is generated, so memory stays bounded no matter how many patients you request. For runs of **more than 1000 patients** the writer automatically emits **batched multi-row `INSERT`s** (up to 500 rows per statement) — a substantial speedup for both generation and the MySQL load. The data is identical either way; at ≤1000 patients the output stays single-row (and byte-identical to older versions), so reproducible fixtures are unaffected. No flags needed — it's automatic.
+
 ## Command Line Options
 
 | Option | Default | Description |
