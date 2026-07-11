@@ -531,6 +531,41 @@ PERIO_FLAG_SUPP = 2
 PERIO_FLAG_PLAQUE = 4
 PERIO_FLAG_CALC = 8
 
+# ---------------------------------------------------------------------------
+# Chronological, globally-interleaved perio primary keys (matching real Open Dental).
+#
+# In a real Open Dental database PerioExamNum / PerioMeasureNum are chronological
+# auto-increment keys, so a patient charted over several years has exams SCATTERED
+# across the table, interleaved with every other patient's visits -- NOT contiguous.
+# We therefore assign the keys from the exam DATE instead of a per-patient running
+# counter (which would make each patient's rows contiguous):
+#
+#   day_index       = (exam_date - history_start).days             # 0-based calendar day
+#   PerioExamNum    = PERIO_EXAM_BASE + day_index*PERIO_EXAM_STRIDE + nth_exam_that_day
+#   PerioMeasureNum = PERIO_MEAS_BASE + day_index*PERIO_MEAS_STRIDE + nth_measure_that_day
+#
+# Exams thus sort strictly by date -> a single patient's exams land far apart in key
+# space, scattered among every other patient's (the OD API returns them chronologically).
+# An exam's measures are emitted consecutively, so they get consecutive per-day counters
+# and stay GROUPED under their exam (real OD groups one exam's sites together). The
+# per-day counters are small dicts (one int per calendar day, ~1100 days total), NOT a
+# whole-corpus buffer -> streaming-safe.
+#
+# int32 safety (keys must stay < 2,147,483,647, unique, positive):
+#   The data spans history_start..today == 3*365 = 1095 days, so day_index in [0, ~1095].
+#   Strides sit well above the busiest single day a large run produces (a 40k-patient run
+#   peaks at a few hundred exams / ~70k measures on its busiest calendar day):
+#     max PerioExamNum    = 10000 + 1095*100000  + 100000  ~= 1.10e8  (<< 2.147e9)
+#     max PerioMeasureNum = 10000 + 1095*1500000 + 1500000 ~= 1.65e9  (<  2.147e9)
+#   Headroom is 100000 exams and 1.5M measures per day before a stride is exhausted
+#   (~1.5M measures/day ~= 7800 exams/day ~= >800k patients); _emit_perio_exam and
+#   _create_periomeasure assert the per-day counter never reaches its stride, failing
+#   closed rather than risk a cross-day key collision.
+PERIO_EXAM_BASE = 10000
+PERIO_MEAS_BASE = 10000
+PERIO_EXAM_STRIDE = 100_000
+PERIO_MEAS_STRIDE = 1_500_000
+
 PERIO_MIN_AGE = 18  # only adults are periodontally charted
 
 # Universal numbering; exclude 3rd molars (1/16/17/32), usually absent.
@@ -944,8 +979,13 @@ class SyntheticDataGenerator:
         self.next_insplan_num = 100
         self.next_inssub_num = 10000
         self.next_patplan_num = 10000
-        self.next_perioexam_num = 10000
-        self.next_periomeasure_num = 10000
+        # Perio PKs are assigned CHRONOLOGICALLY (see PERIO_EXAM_BASE/PERIO_MEAS_BASE above
+        # the class): one small counter PER CALENDAR DAY keeps exams globally date-ordered
+        # (so a patient's exams scatter across the table interleaved with everyone else's,
+        # like real Open Dental) while each exam's measures stay grouped. Streaming-safe --
+        # one int per ~1100 days, not a whole-corpus buffer.
+        self._perio_exam_day_counter = defaultdict(int)
+        self._perio_meas_day_counter = defaultdict(int)
         # Medical-history tables. Def tables also start at 10000 (not 100 like
         # carriers/insplans): real practices commonly carry >100 diseasedef/medication
         # rows, so 100 would risk colliding when loading into an existing database.
@@ -2289,8 +2329,16 @@ class SyntheticDataGenerator:
 
     def _create_periomeasure(self, exam_num: int, exam_dt: datetime, seq_type: int,
                              tooth: int, tooth_value: int, surfaces: list):
-        m_num = self.next_periomeasure_num
-        self.next_periomeasure_num += 1
+        # Chronological key derived from the exam's calendar day: measures are emitted
+        # consecutively within an exam, so their per-day counters are consecutive and the
+        # exam's sites stay GROUPED, while the block scatters by date across the table.
+        day_index = (exam_dt.date() - self.history_start).days
+        n = self._perio_meas_day_counter[day_index]
+        self._perio_meas_day_counter[day_index] = n + 1
+        assert day_index >= 0 and n < PERIO_MEAS_STRIDE, (
+            f"periomeasure key overflow: day_index={day_index}, nth={n} "
+            f"(stride {PERIO_MEAS_STRIDE}) -- would collide across days")
+        m_num = PERIO_MEAS_BASE + day_index * PERIO_MEAS_STRIDE + n
         mb, b, db, ml, l, dl = surfaces
         self.periomeasure_count += 1
         self.sql_statements.append(generate_insert(
@@ -2312,8 +2360,15 @@ class SyntheticDataGenerator:
         RNG, so the emitted SQL is unaffected."""
         if not chart:
             return None
-        exam_num = self.next_perioexam_num
-        self.next_perioexam_num += 1
+        # Chronological key: base + (calendar day since history_start)*stride + Nth exam
+        # that day. Exams sort by date -> this patient's exams scatter among all others'.
+        day_index = (exam_date - self.history_start).days
+        n = self._perio_exam_day_counter[day_index]
+        self._perio_exam_day_counter[day_index] = n + 1
+        assert day_index >= 0 and n < PERIO_EXAM_STRIDE, (
+            f"perioexam key overflow: day_index={day_index}, nth={n} "
+            f"(stride {PERIO_EXAM_STRIDE}) -- would collide across days")
+        exam_num = PERIO_EXAM_BASE + day_index * PERIO_EXAM_STRIDE + n
         exam_dt = datetime.combine(
             exam_date,
             datetime.min.time().replace(hour=random.randint(8, 16), minute=random.choice([0, 15, 30, 45])))
