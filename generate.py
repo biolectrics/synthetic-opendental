@@ -1047,29 +1047,30 @@ class SyntheticDataGenerator:
         print("  Generating base reference data...")
 
         # Generate definition records for BillingTypes (Category 4)
-        for name, defnum in BILLING_TYPE_DEFNUMS.items():
+        # ItemOrder is 0-based WITHIN each category (enumerate), never the DefNum.
+        for order, (name, defnum) in enumerate(BILLING_TYPE_DEFNUMS.items()):
             display_name = name.replace("_", " - ") if "_" in name else name
             self.sql_statements.append(generate_insert(
                 "definition",
                 ["DefNum", "Category", "ItemOrder", "ItemName", "ItemValue", "ItemColor", "IsHidden"],
-                [defnum, 4, defnum, display_name, "", 0, 0]
+                [defnum, 4, order, display_name, "", 0, 0]
             ))
 
         # Generate definition records for PaymentTypes (Category 10)
-        for name, defnum in PAYMENT_TYPE_DEFNUMS.items():
+        for order, (name, defnum) in enumerate(PAYMENT_TYPE_DEFNUMS.items()):
             display_name = name.replace("_", " ")
             self.sql_statements.append(generate_insert(
                 "definition",
                 ["DefNum", "Category", "ItemOrder", "ItemName", "ItemValue", "ItemColor", "IsHidden"],
-                [defnum, 10, defnum, display_name, "", 0, 0]
+                [defnum, 10, order, display_name, "", 0, 0]
             ))
 
         # Generate definition records for ProcCodeCats (Category 11)
-        for name, defnum in PROC_CAT_DEFNUMS.items():
+        for order, (name, defnum) in enumerate(PROC_CAT_DEFNUMS.items()):
             self.sql_statements.append(generate_insert(
                 "definition",
                 ["DefNum", "Category", "ItemOrder", "ItemName", "ItemValue", "ItemColor", "IsHidden"],
-                [defnum, 11, defnum, name, "", 0, 0]
+                [defnum, 11, order, name, "", 0, 0]
             ))
 
         # Generate procedurecode records for all codes we use
@@ -1131,8 +1132,8 @@ class SyntheticDataGenerator:
 
             self.sql_statements.append(generate_insert(
                 "provider",
-                ["ProvNum", "Abbr", "LName", "FName", "MI", "Suffix", "IsSecondary", "IsHidden", "ProvStatus"],
-                [prov_num, prov["abbr"], prov["lname"], prov["fname"], "", prov["suffix"], prov["is_secondary"], 0, 0]
+                ["ProvNum", "Abbr", "LName", "FName", "MI", "Suffix", "IsSecondary", "IsHidden", "ProvStatus", "ItemOrder"],
+                [prov_num, prov["abbr"], prov["lname"], prov["fname"], "", prov["suffix"], prov["is_secondary"], 0, 0, i]
             ))
 
     def _generate_operatories(self):
@@ -1153,7 +1154,10 @@ class SyntheticDataGenerator:
             self.sql_statements.append(generate_insert(
                 "operatory",
                 ["OperatoryNum", "OpName", "Abbrev", "ItemOrder", "IsHidden", "ProvDentist", "ProvHygienist", "IsHygiene"],
-                [op_num, op["name"], op["abbrev"], op_num, 0, op["prov_dentist"], op["prov_hygienist"], op["is_hygiene"]]
+                # ItemOrder is Open Dental's 0-BASED DISPLAY POSITION, not a key. Passing op_num here wrote
+                # 100,101,... into a four-row table, and the Appointments module indexes its operatory-column
+                # list BY ItemOrder -- so the client threw "Index was out of range" on every launch.
+                [op_num, op["name"], op["abbrev"], i, 0, op["prov_dentist"], op["prov_hygienist"], op["is_hygiene"]]
             ))
 
     def _generate_carriers(self):

@@ -38,6 +38,10 @@ ENV/
 # Keep the examples/ sample but ignore other large outputs
 *.sql
 !examples/*.sql
+# clear_demo.sql is SOURCE, not a generated dump -- the blanket *.sql rule was silently excluding it, so a
+# fix to it could be committed with `git add -A` and simply vanish. It is the script that decides which
+# tables a load wipes, which makes it the most consequential file here.
+!clear_demo.sql
 
 # OS
 .DS_Store

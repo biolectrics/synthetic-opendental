@@ -315,6 +315,28 @@ def main():
     check(ti > 0 and tw > 0 and ts > 0, "trajectory diversity: some improve, some stay same, some worsen")
     check(any(len(v) >= 2 for v in examsByPat.values()), "patients have multi-visit longitudinal series")
 
+    # ---- ItemOrder is a 0-BASED DISPLAY POSITION, never a primary key -----------------------------
+    # Regression gate for the defect that broke the Open Dental CLIENT outright (2026-07-27 .. 07-30):
+    # the emitters passed the row's own id as ItemOrder, so `operatory` carried 100,101,102,103 in a
+    # four-row table. The Appointments module indexes its operatory-column list BY ItemOrder, so the
+    # client threw an unhandled "Index was out of range" in ControlAppt.ModuleSelected on every launch.
+    # Privara never noticed because it only ever READS. Contiguous-from-zero is the invariant.
+    ops = sorted(int(o["ItemOrder"]) for o in rows["operatory"])
+    check(ops == list(range(len(ops))),
+          f"operatory.ItemOrder is 0-based and contiguous (got {ops})")
+
+    provs = sorted(int(p["ItemOrder"]) for p in rows["provider"] if "ItemOrder" in p)
+    check(not provs or provs == list(range(len(provs))),
+          f"provider.ItemOrder is 0-based and contiguous (got {provs})")
+
+    defsByCat = {}
+    for d in rows["definition"]:
+        defsByCat.setdefault(int(d["Category"]), []).append(int(d["ItemOrder"]))
+    for cat, orders in sorted(defsByCat.items()):
+        orders = sorted(orders)
+        check(orders == list(range(len(orders))),
+              f"definition.ItemOrder is 0-based within category {cat} (got {orders})")
+
     return failures
 
 if __name__ == "__main__":
